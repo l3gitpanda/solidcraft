@@ -733,7 +733,7 @@ fn files_a_call_names_go_to_the_tab_and_what_the_tab_writes_comes_back() {
     assert!(!failed(&opened) && text(&opened).contains("a design"), "{opened}");
     // Unchanged, it is not sent again; changed, it is.
     client.call("execute", json!({"command": "file.open", "params": {"path": design}}));
-    assert_eq!(*tab.written.lock().unwrap(), [design.clone()]);
+    assert_eq!(tab.written.lock().unwrap().as_slice(), [design.as_str()]);
     std::fs::write(&design, "a design, changed since").unwrap();
     let reopened = client.call("execute", json!({"command": "file.open", "params": {"path": design}}));
     assert!(text(&reopened).contains("changed since"), "{reopened}");

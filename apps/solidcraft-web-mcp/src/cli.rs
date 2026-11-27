@@ -33,7 +33,7 @@ URL#mcp-token=<token> once; the browser remembers the token after that.
 /// What the command line asks for.
 #[derive(Debug)]
 pub enum Command {
-    Serve { config: Config, data: Vec<PathBuf> },
+    Serve { config: Box<Config>, data: Vec<PathBuf> },
     Healthcheck { listen: String },
     Help,
 }
@@ -90,7 +90,7 @@ pub fn parse(args: &[String], env: impl Fn(&str) -> Option<String>) -> Result<Co
         waits: Waits::default(),
     };
     config.check()?;
-    Ok(Command::Serve { config, data })
+    Ok(Command::Serve { config: Box::new(config), data })
 }
 
 #[cfg(test)]

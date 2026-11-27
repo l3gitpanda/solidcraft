@@ -48,7 +48,7 @@ fn run() -> Result<(), String> {
             config.folders = data.iter().filter_map(|d| std::path::absolute(d).ok()).collect();
             config.scope = Some(scope);
             let (token, open_link) = (config.token.is_some(), config.open_link);
-            let relay = Relay::bind(config)?;
+            let relay = Relay::bind(*config)?;
             let address = relay.local_addr().map_err(|e| e.to_string())?;
             note!("solidcraft-web-mcp: the app is at http://{address}/ and MCP at http://{address}/mcp");
             note!("solidcraft-web-mcp: agents' files are limited to {}", folders.join(", "));
