@@ -1,0 +1,32 @@
+[package]
+name = "solidcraft-web-mcp"
+description = "Serves the SolidCraft web app and MCP over HTTP, relaying each tool call to the open browser tab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+solidcraft-mcp = { workspace = true }
+solidcraft-mcp-server = { workspace = true }
+solidcraft-engine = { workspace = true }
+solidcraft-control = { workspace = true }
+serde_json = { workspace = true }
+# HTTP request heads (MIT OR Apache-2.0); already in the lockfile through ureq.
+httparse = "1"
+# The WebSocket handshake's accept key (MIT OR Apache-2.0); already in the lockfile.
+sha1 = "0.10"
+base64 = "0.22"
+# Session ids: random bytes from the operating system (MIT OR Apache-2.0).
+getrandom = "0.3"
+
+[dev-dependencies]
+tempfile = "3.27"
+
+# The whole chain with the real web app in headless Chrome: run on request (see the file's head).
+[[test]]
+name = "browser"
+path = "tests/browser.rs"

@@ -23,6 +23,8 @@ mod install;
 mod keep;
 #[cfg(target_arch = "wasm32")]
 mod linked;
+#[cfg(any(all(target_arch = "wasm32", feature = "mcp-link"), test))]
+mod mcp_link;
 #[cfg(any(target_arch = "wasm32", test))]
 mod mouse_buttons;
 #[cfg(any(target_arch = "wasm32", test))]
@@ -1611,6 +1613,8 @@ mod web {
                         }
                         let mouse_buttons = crate::mouse_buttons::install(&window, &mouse_canvas, &cc.egui_ctx);
                         let wheel_samples = crate::wheel_samples::install(&window);
+                        #[cfg(feature = "mcp-link")]
+                        crate::mcp_link::start(sender.clone(), cc.egui_ctx.clone());
                         let api = Api::install(sender, cc.egui_ctx.clone()).map_err(|e| format!("SolidCraft browser API: {e:?}"))?;
                         let font_language = app.preferences.language.clone();
                         let linked = crate::linked::Download::start(launch.open.as_deref(), &cc.egui_ctx);
