@@ -172,6 +172,11 @@ fn text(result: &Value) -> String {
     result["content"].as_array().into_iter().flatten().filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("\n")
 }
 
+/// A tool result's reply: its first text block, read as JSON.
+fn reply(result: &Value) -> Value {
+    result["content"][0]["text"].as_str().and_then(|t| serde_json::from_str(t).ok()).unwrap_or(Value::Null)
+}
+
 fn failed(result: &Value) -> bool {
     result["isError"] == true
 }
@@ -529,7 +534,7 @@ fn a_tool_call_runs_in_the_tab_and_its_result_comes_back() {
         client.stream = stream;
         let made = client.call("execute", json!({"command": "solid.box", "params": {"size": [30, 20, 10]}}));
         assert!(!failed(&made), "{made}");
-        assert!(text(&made).contains("Body 1") && text(&made).contains("[30,20,10]"), "{made}");
+        assert!(reply(&made) == json!({"created": "Body 1", "size": [30, 20, 10]}), "{made}");
     }
     assert_eq!(tab.commands(), ["solid.box", "solid.box"]);
     assert_eq!(tab.seen.lock().unwrap()[0].1, json!({"command": "solid.box", "params": {"size": [30, 20, 10]}}));
@@ -604,7 +609,7 @@ fn a_call_that_outlasts_its_wait_is_still_running_and_pending_gets_its_result() 
     let running = client.call("running", json!({}));
     assert!(text(&running).contains("solid.slow"), "{running}");
     let pending = client.call("pending", json!({}));
-    assert!(!failed(&pending) && text(&pending).contains(r#""slow":"done""#), "{pending}");
+    assert!(!failed(&pending) && reply(&pending)["result"] == json!({"slow": "done"}), "{pending}");
     assert!(text(&client.call("pending", json!({}))).contains("nothing is running"));
 
     // A new call waits for the earlier one first, and `pending` still has its result after.
@@ -613,7 +618,7 @@ fn a_call_that_outlasts_its_wait_is_still_running_and_pending_gets_its_result() 
     assert!(!failed(&next), "{next}");
     assert_eq!(tab.commands(), ["solid.slow", "solid.slow", "solid.box"]);
     let earlier = client.call("pending", json!({}));
-    assert!(text(&earlier).contains(r#""slow":"done""#), "{earlier}");
+    assert!(reply(&earlier)["result"] == json!({"slow": "done"}), "{earlier}");
 }
 
 #[test]
