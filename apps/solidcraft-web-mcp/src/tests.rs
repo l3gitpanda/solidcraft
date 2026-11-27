@@ -359,12 +359,13 @@ fn file_reply(
             json!({"data": b64.encode(&bytes[offset..end]), "size": bytes.len()})
         }
         Some("list") => {
-            let roots: Vec<String> =
-                message["roots"].as_array().unwrap().iter().map(|r| format!("{}/", r.as_str().unwrap().trim_end_matches('/'))).collect();
+            // As the real tab does: a root's files lie beyond either separator (Windows spells paths with `\`).
+            let roots: Vec<&str> = message["roots"].as_array().unwrap().iter().map(|r| r.as_str().unwrap().trim_end_matches(['/', '\\'])).collect();
+            let under = |path: &str, root: &str| path.strip_prefix(root).is_some_and(|rest| rest.starts_with(['/', '\\']));
             let extra = also_lists.lock().unwrap();
             let listed: Vec<Value> = files
                 .iter()
-                .filter(|(path, _)| roots.iter().any(|root| path.starts_with(root)) || extra.contains(path))
+                .filter(|(path, _)| roots.iter().any(|root| under(path, root)) || extra.contains(path))
                 .map(|(path, bytes)| json!({"path": path, "size": bytes.len(), "digest": digest(bytes)}))
                 .collect();
             json!({"files": listed})

@@ -162,6 +162,7 @@ mod tests {
         std::fs::write(dir.path().join("index.html"), "<html>").unwrap();
         std::fs::write(dir.path().join("app-0123abcd_bg.wasm"), b"\0asm-plain").unwrap();
         std::fs::write(dir.path().join("app-0123abcd_bg.wasm.gz"), b"gz").unwrap();
+        #[cfg(unix)]
         let outside = tempfile::NamedTempFile::new().unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path(), dir.path().join("leak.txt")).unwrap();
