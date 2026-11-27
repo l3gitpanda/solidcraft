@@ -113,9 +113,12 @@ pub fn file_reply(store: &mut dyn Store, message: &Value) -> Value {
         Some("list") => {
             let mut files = Vec::new();
             for root in message.get("roots").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
-                let prefix = format!("{}/", root.trim_end_matches(['/', '\\']));
-                for (path, size) in store.list(&prefix) {
-                    if files.iter().all(|f: &Value| f["path"] != path.as_str())
+                // The server's paths are its own computer's: `/data/x` or `C:\data\x`. The files
+                // are kept under the path as it was given, so either separator ends the root.
+                let root = root.trim_end_matches(['/', '\\']);
+                for (path, size) in store.list(root) {
+                    if path.get(root.len()..).is_some_and(|rest| rest.starts_with(['/', '\\']))
+                        && files.iter().all(|f: &Value| f["path"] != path.as_str())
                         && let Some(bytes) = store.read(&path)
                     {
                         files.push(json!({"path": path, "size": size, "digest": digest(&bytes)}));
@@ -499,6 +502,8 @@ mod tests {
         store.insert("/data/sub/b.bin", vec![7; 10]);
         store.insert("/database/c.bin", vec![1]);
         store.insert("/tmp/shot.png", vec![2]);
+        store.insert(r"C:\data\win\d.bin", vec![3]);
+        store.insert(r"C:\database\e.bin", vec![4]);
         let listed = call(&mut store, json!({"fs": "list", "roots": ["/data", "/data/", "/tmp"]}));
         let paths: Vec<&str> = listed["result"]["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
         assert_eq!(paths, ["/data/a.bin", "/data/sub/b.bin", "/tmp/shot.png"], "a root names a folder, never a longer name; no file twice");
@@ -506,6 +511,9 @@ mod tests {
         let part = call(&mut store, json!({"fs": "read", "path": "/data/a.bin", "offset": 6, "len": 3}));
         assert_eq!(part["result"], json!({"data": encode(b"wor"), "size": 11}));
         assert_eq!(call(&mut store, json!({"fs": "read", "path": "/data/a.bin", "offset": 99}))["result"]["data"], "");
+        // A server on Windows names its folders its own way.
+        let windows = call(&mut store, json!({"fs": "list", "roots": [r"C:\data", r"C:\data\"]}));
+        assert_eq!(windows["result"]["files"], json!([{"path": r"C:\data\win\d.bin", "size": 1, "digest": digest(&[3])}]));
         assert_eq!(call(&mut store, json!({"fs": "remove", "paths": ["/tmp/shot.png", "/nowhere"]}))["ok"], true);
         assert!(store.read("/tmp/shot.png").is_none());
         for (bad, why) in [

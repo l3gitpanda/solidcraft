@@ -204,16 +204,28 @@ impl TabBackend {
         }
     }
 
+    /// The reply of a request that ended after its call returned, with its files brought back. A
+    /// request that ran but whose files could not be copied did not do what was asked: its reply
+    /// becomes an error that says so.
+    fn collect(&self, o: &Outstanding, reply: Value) -> Value {
+        if o.syncs
+            && let Err(e) = self.pull(&mut self.hub.turn(), o.ticket.tab)
+            && reply.get("ok").and_then(Value::as_bool) == Some(true)
+        {
+            return json!({"ok": false, "error": format!("it ran, but its files could not be copied from the browser tab: {e}")});
+        }
+        reply
+    }
+
     /// Before a new request: wait out one still running from an earlier call, keeping its end for
     /// `pending`. Still running after the wait: the new request is not sent.
     fn settle_earlier(&mut self) -> Result<(), String> {
         let Some(o) = self.outstanding.take() else { return Ok(()) };
         match self.wait(o.ticket, &o.what, o.since, self.waits.settle) {
             (Waited::Reply(reply), _) => {
-                if o.syncs {
-                    // Its files, late: a failure here is the earlier request's, not this call's.
-                    let _ = self.pull(&mut self.hub.turn(), o.ticket.tab);
-                }
+                // Its files, late. A failure to copy them is the earlier request's, not this
+                // call's: it is kept with the reply for `pending` to report.
+                let reply = self.collect(&o, reply);
                 self.settled = Some(Settled::Finished { what: o.what, reply });
                 Ok(())
             }
@@ -245,15 +257,7 @@ impl TabBackend {
         }
         let Some(o) = self.outstanding.take() else { return json!({"pending": null}) };
         match self.wait(o.ticket, &o.what, o.since, self.waits.settle) {
-            (Waited::Reply(mut reply), _) => {
-                if o.syncs
-                    && let Err(e) = self.pull(&mut self.hub.turn(), o.ticket.tab)
-                    && reply.get("ok").and_then(Value::as_bool) == Some(true)
-                {
-                    reply = json!({"ok": false, "error": format!("it ran, but its files could not be copied from the browser tab: {e}")});
-                }
-                json!({"pending": o.what, "done": true, "reply": reply})
-            }
+            (Waited::Reply(reply), _) => json!({"pending": o.what, "done": true, "reply": self.collect(&o, reply)}),
             (Waited::Lost, _) => json!({"pending": o.what, "lost": true}),
             (Waited::Running, cancelled) => {
                 let reply = match cancelled {

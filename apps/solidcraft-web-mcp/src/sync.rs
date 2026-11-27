@@ -41,13 +41,26 @@ struct Entry {
     digest: String,
 }
 
-/// What has been copied to and from one tab. A new tab starts with empty memory, so the record
-/// is dropped when the driven tab changes.
+/// What has been copied to and from one tab.
+#[derive(Default)]
+struct Record {
+    files: HashMap<String, Entry>,
+    /// The files that could not be brought back, by the digest they had in the tab then: the
+    /// failure is reported once, to the call that found it, not to every call after.
+    failed: HashMap<String, String>,
+}
+
+/// What has been copied to and from each tab. A tab's memory is its own (a new tab starts empty,
+/// and one left for another keeps what it had), so each has its own record: a file an earlier
+/// tab still holds unchanged is never mistaken for one it has just written.
 #[derive(Default)]
 pub struct Synced {
-    tab: u64,
-    files: HashMap<String, Entry>,
+    tabs: HashMap<u64, Record>,
 }
+
+/// The most tabs a record is kept for; the oldest tab's goes first (ids only grow, and a tab
+/// that reloads comes back under a new one).
+const MAX_TABS: usize = 16;
 
 /// The absolute paths `params` names, anywhere in it, in order and without repeats.
 pub fn named_paths(params: &Value) -> Vec<String> {
@@ -75,25 +88,54 @@ pub trait Tab {
     fn file(&mut self, message: Value) -> Result<Value, String>;
 }
 
-impl Synced {
-    fn for_tab(&mut self, tab: u64) {
-        if self.tab != tab {
-            self.tab = tab;
-            self.files.clear();
+/// Read the whole of `path` (`size` bytes) from the tab, a chunk at a time.
+fn fetch(tab: &mut dyn Tab, path: &str, size: u64) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    while (bytes.len() as u64) < size {
+        let part = tab.file(json!({"fs": "read", "path": path, "offset": bytes.len(), "len": CHUNK}))?;
+        let data = part.get("data").and_then(Value::as_str).unwrap_or_default();
+        let chunk = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| format!("the tab sent bytes that do not decode ({e})"))?;
+        if chunk.is_empty() || bytes.len() + chunk.len() > MAX_FILE {
+            return Err(format!("the tab sent {} of {size} bytes", bytes.len()));
         }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+/// Put `bytes` at `path` on this side, making its folder if need be. Whole or not at all: a copy
+/// cut short (a full disk, the server stopped) leaves the file that was there, a saved design
+/// above all, as it was.
+fn publish(path: &str, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = Path::new(path).parent().and_then(Path::to_str).filter(|p| !p.is_empty()) {
+        vfs::create_new_dir_all(parent).map_err(|e| format!("{parent}: {e}"))?;
+    }
+    vfs::check(path).and_then(|()| solidcraft_engine::io::write_atomic(Path::new(path), bytes, false)).map_err(|e| e.to_string())
+}
+
+impl Synced {
+    /// The record of tab `tab`, made if it has none.
+    fn record(&mut self, tab: u64) -> &mut Record {
+        while self.tabs.len() >= MAX_TABS && !self.tabs.contains_key(&tab) {
+            let Some(oldest) = self.tabs.keys().min().copied() else { break };
+            self.tabs.remove(&oldest);
+        }
+        self.tabs.entry(tab).or_default()
     }
 
     /// Before a call: send the tab each file `params` names that exists here and that the tab
     /// does not have as it is now.
     pub fn push(&mut self, tab: &mut dyn Tab, params: &Value) -> Result<(), String> {
-        self.for_tab(tab.id());
+        let record = self.record(tab.id());
         for path in named_paths(params) {
+            // A call that names a file is tried afresh, whatever became of the file before.
+            record.failed.remove(&path);
             // Not one of the agent's files here: a path of the tab's own (browser storage, an upload).
             if vfs::check(&path).is_err() || !vfs::is_file(&path) {
                 continue;
             }
             let here = vfs::stamp(&path);
-            if here.is_some() && self.files.get(&path).is_some_and(|e| e.here == here) {
+            if here.is_some() && record.files.get(&path).is_some_and(|e| e.here == here) {
                 continue;
             }
             let bytes = vfs::read(&path, MAX_FILE).map_err(|e| format!("{path}: {e}"))?;
@@ -103,22 +145,23 @@ impl Synced {
             for chunk in chunks {
                 tab.file(json!({"fs": "write", "path": path, "data": base64::engine::general_purpose::STANDARD.encode(chunk), "append": true}))?;
             }
-            self.files.insert(path, Entry { here, digest: digest(&bytes) });
+            record.files.insert(path, Entry { here, digest: digest(&bytes) });
         }
         Ok(())
     }
 
     /// After a call: bring back each file the tab holds under `roots` that is new or changed
     /// there, then drop the tab's copies of the files under `transient` (the scratch folder:
-    /// screenshots the tool reads once).
+    /// screenshots the tool reads once). A file that cannot be brought back does not stop the
+    /// others; the error names it, once.
     pub fn pull(&mut self, tab: &mut dyn Tab, roots: &[String], transient: Option<&str>) -> Result<(), String> {
-        self.for_tab(tab.id());
+        let record = self.record(tab.id());
         if roots.is_empty() {
             return Ok(());
         }
         let listing = tab.file(json!({"fs": "list", "roots": roots}))?;
         let files = listing.get("files").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
-        let mut spent = Vec::new();
+        let (mut spent, mut errors) = (Vec::new(), Vec::new());
         for file in files.iter().take(MAX_FILES) {
             let (Some(path), Some(size), Some(digest)) =
                 (file.get("path").and_then(Value::as_str), file.get("size").and_then(Value::as_u64), file.get("digest").and_then(Value::as_str))
@@ -128,42 +171,36 @@ impl Synced {
             if transient.is_some_and(|t| Path::new(path).starts_with(t)) {
                 spent.push(path.to_string());
             }
-            if self.files.get(path).is_some_and(|e| e.digest == digest) {
+            if record.files.get(path).is_some_and(|e| e.digest == digest) || record.failed.get(path).is_some_and(|d| d == digest) {
                 continue;
             }
             // The tab names the path; the scope decides whether it is one of the agent's.
             if size > MAX_FILE as u64 || vfs::check_new(path).is_err() {
                 continue;
             }
-            let mut bytes = Vec::new();
-            while (bytes.len() as u64) < size {
-                let part = tab.file(json!({"fs": "read", "path": path, "offset": bytes.len(), "len": CHUNK}))?;
-                let data = part.get("data").and_then(Value::as_str).unwrap_or_default();
-                let chunk = base64::engine::general_purpose::STANDARD
-                    .decode(data)
-                    .map_err(|e| format!("{path}: the tab sent bytes that do not decode ({e})"))?;
-                if chunk.is_empty() || bytes.len() + chunk.len() > MAX_FILE {
-                    return Err(format!("{path}: the tab sent {} of {size} bytes", bytes.len()));
+            match fetch(tab, path, size).and_then(|bytes| publish(path, &bytes)) {
+                Ok(()) => {
+                    record.failed.remove(path);
+                    record.files.insert(path.to_string(), Entry { here: vfs::stamp(path), digest: digest.to_string() });
                 }
-                bytes.extend_from_slice(&chunk);
+                Err(e) => {
+                    record.failed.insert(path.to_string(), digest.to_string());
+                    errors.push(format!("{path}: {e}"));
+                }
             }
-            if let Some(parent) = Path::new(path).parent().and_then(Path::to_str).filter(|p| !p.is_empty()) {
-                vfs::create_new_dir_all(parent).map_err(|e| format!("{parent}: {e}"))?;
-            }
-            // Whole or not at all: a copy cut short (a full disk, the server stopped) leaves the
-            // file that was there, a saved design above all, as it was.
-            vfs::check(path)
-                .and_then(|()| solidcraft_engine::io::write_atomic(Path::new(path), &bytes, false))
-                .map_err(|e| format!("{path}: {e}"))?;
-            self.files.insert(path.to_string(), Entry { here: vfs::stamp(path), digest: digest.to_string() });
         }
         if !spent.is_empty() {
             for path in &spent {
-                self.files.remove(path);
+                record.files.remove(path);
+                record.failed.remove(path);
             }
             tab.file(json!({"fs": "remove", "paths": spent}))?;
         }
-        Ok(())
+        match errors.len() {
+            0 => Ok(()),
+            1 => Err(errors.remove(0)),
+            n => Err(format!("{} (and {} more files)", errors.remove(0), n - 1)),
+        }
     }
 }
 

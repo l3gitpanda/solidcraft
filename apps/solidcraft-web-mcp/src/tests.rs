@@ -209,6 +209,8 @@ struct FakeTab {
     written: Arc<Mutex<Vec<String>>>,
     /// Paths a hostile tab adds to every listing, whatever was asked for.
     also_lists: Arc<Mutex<Vec<String>>>,
+    /// Paths it lists but then fails to hand over.
+    unreadable: Arc<Mutex<Vec<String>>>,
 }
 
 /// Open the link's WebSocket as a page served by the relay would, and say hello.
@@ -246,8 +248,16 @@ impl FakeTab {
         let (opcode, welcome) = read_server_frame(&mut input).unwrap();
         assert_eq!(opcode, 1);
         assert!(serde_json::from_slice::<Value>(&welcome).unwrap()["welcome"]["tab"].is_u64());
-        let tab = FakeTab { socket, files: Files::default(), seen: Arc::default(), written: Arc::default(), also_lists: Arc::default() };
-        let (files, seen, written, also_lists) = (tab.files.clone(), tab.seen.clone(), tab.written.clone(), tab.also_lists.clone());
+        let tab = FakeTab {
+            socket,
+            files: Files::default(),
+            seen: Arc::default(),
+            written: Arc::default(),
+            also_lists: Arc::default(),
+            unreadable: Arc::default(),
+        };
+        let (files, seen, written, also_lists, unreadable) =
+            (tab.files.clone(), tab.seen.clone(), tab.written.clone(), tab.also_lists.clone(), tab.unreadable.clone());
         let output = Arc::new(Mutex::new(tab.socket.try_clone().unwrap()));
         std::thread::spawn(move || {
             let reply = |output: &Arc<Mutex<TcpStream>>, mut reply: Value, id: &Value| {
@@ -265,7 +275,7 @@ impl FakeTab {
                         let message: Value = serde_json::from_slice(&payload).unwrap();
                         let id = message["id"].clone();
                         if message.get("fs").is_some() {
-                            let answer = file_reply(&files, &written, &also_lists, &message);
+                            let answer = file_reply(&files, &written, &also_lists, &unreadable, &message);
                             reply(&output, answer, &id);
                         } else if let Some(method) = message["method"].as_str() {
                             seen.lock().unwrap().push((method.to_string(), message["params"].clone()));
@@ -318,7 +328,13 @@ impl Drop for FakeTab {
 }
 
 /// The tab's file messages, as `mcp_link::file_reply` answers them.
-fn file_reply(files: &Files, written: &Mutex<Vec<String>>, also_lists: &Mutex<Vec<String>>, message: &Value) -> Value {
+fn file_reply(
+    files: &Files,
+    written: &Mutex<Vec<String>>,
+    also_lists: &Mutex<Vec<String>>,
+    unreadable: &Mutex<Vec<String>>,
+    message: &Value,
+) -> Value {
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut files = files.lock().unwrap();
     let result = match message["fs"].as_str() {
@@ -334,7 +350,10 @@ fn file_reply(files: &Files, written: &Mutex<Vec<String>>, also_lists: &Mutex<Ve
             json!({"size": files[&path].len()})
         }
         Some("read") => {
-            let Some(bytes) = files.get(message["path"].as_str().unwrap()) else { return json!({"ok": false, "error": "no such file in this tab"}) };
+            let path = message["path"].as_str().unwrap();
+            let Some(bytes) = files.get(path).filter(|_| !unreadable.lock().unwrap().iter().any(|u| u == path)) else {
+                return json!({"ok": false, "error": "no such file in this tab"});
+            };
             let offset = (message["offset"].as_u64().unwrap_or(0) as usize).min(bytes.len());
             let end = bytes.len().min(offset + message["len"].as_u64().unwrap_or(u64::MAX).min(1 << 30) as usize);
             json!({"data": b64.encode(&bytes[offset..end]), "size": bytes.len()})
@@ -605,6 +624,82 @@ fn a_call_keeps_to_the_tab_it_began_in_when_another_links() {
     // The next call goes to the second tab.
     client.call("execute", json!({"command": "solid.box"}));
     assert_eq!(second.commands(), ["solid.box"]);
+}
+
+/// A tab whose `file.save` keeps `params.text` at `params.path`, as a save of the design would.
+fn saving_tab(fixture: &Fixture) -> FakeTab {
+    FakeTab::link(
+        fixture,
+        Box::new(|_, params, files| {
+            if params["command"] == "file.save" {
+                files
+                    .lock()
+                    .unwrap()
+                    .insert(params["params"]["path"].as_str().unwrap().to_string(), params["params"]["text"].as_str().unwrap().as_bytes().to_vec());
+            }
+            ok(json!({}))
+        }),
+    )
+}
+
+#[test]
+fn a_tab_returned_to_does_not_bring_back_its_old_files() {
+    let fixture = relay();
+    let design = path_text(&fixture.data.join("part.sc"));
+    let save = |text: &str| json!({"command": "file.save", "params": {"path": design, "text": text}});
+    let mut client = Client::open(fixture.addr);
+    let first = saving_tab(&fixture);
+    client.call("execute", save("saved in the first tab"));
+    assert_eq!(std::fs::read_to_string(&design).unwrap(), "saved in the first tab");
+    // A second window saves a newer design to the same path, then closes.
+    let second = saving_tab(&fixture);
+    client.call("execute", save("saved later in the second tab"));
+    assert_eq!(std::fs::read_to_string(&design).unwrap(), "saved later in the second tab");
+    second.close();
+    until("the second tab to be dropped", || status(fixture.addr)["tabs"] == 1);
+    // Back in the first tab, which still holds its older copy: a call that saves nothing must
+    // not put that copy back over the newer file.
+    client.call("execute", json!({"command": "solid.box"}));
+    assert_eq!(first.commands(), ["file.save", "solid.box"]);
+    assert_eq!(std::fs::read_to_string(&design).unwrap(), "saved later in the second tab");
+    // And when the first tab does save again, that is new and lands.
+    client.call("execute", save("saved again in the first tab"));
+    assert_eq!(std::fs::read_to_string(&design).unwrap(), "saved again in the first tab");
+}
+
+#[test]
+fn a_late_request_whose_files_cannot_be_copied_is_reported_as_failed() {
+    let fixture = relay_with(|config| config.waits.call = Duration::from_millis(150));
+    let out = path_text(&fixture.data.join("part.step"));
+    let tab = FakeTab::link(
+        &fixture,
+        Box::new(|_, params, files| match params["command"].as_str() {
+            Some("file.export") => {
+                files.lock().unwrap().insert(params["params"]["path"].as_str().unwrap().to_string(), b"exported".to_vec());
+                Answer::Later(Duration::from_millis(700), json!({"ok": true, "result": {"exported": true}}))
+            }
+            _ => ok(json!({})),
+        }),
+    );
+    // The tab lists the export but then fails to hand it over.
+    tab.unreadable.lock().unwrap().push(out.clone());
+    let mut client = Client::open(fixture.addr);
+    let slow = client.call("execute", json!({"command": "file.export", "params": {"path": out}}));
+    assert!(text(&slow).starts_with("still running:"), "{slow}");
+    // Another call waits the export out; its files are collected then, and that fails.
+    assert!(!failed(&client.call("execute", json!({"command": "solid.box"}))));
+    assert_eq!(tab.commands(), ["file.export", "solid.box"]);
+    let pending = client.call("pending", json!({}));
+    assert!(failed(&pending) && text(&pending).contains("could not be copied from the browser tab"), "{pending}");
+    assert!(!Path::new(&out).exists());
+    // The failure was the export's, told once: later calls are not failed for it. Asked for
+    // again, the export is tried again, and lands once the tab hands it over.
+    assert!(!failed(&client.call("execute", json!({"command": "solid.box"}))));
+    tab.unreadable.lock().unwrap().clear();
+    client.call("execute", json!({"command": "file.export", "params": {"path": out}}));
+    let retried = client.call("pending", json!({}));
+    assert!(!failed(&retried), "{retried}");
+    assert_eq!(std::fs::read(&out).unwrap(), b"exported");
 }
 
 #[test]
