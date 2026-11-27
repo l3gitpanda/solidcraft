@@ -6785,6 +6785,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "solidcraft-web-mcp"
+version = "0.51.1"
+dependencies = [
+ "base64 0.22.1",
+ "getrandom 0.3.4",
+ "httparse",
+ "serde_json",
+ "sha1 0.10.7",
+ "solidcraft-control",
+ "solidcraft-engine",
+ "solidcraft-mcp",
+ "solidcraft-mcp-server",
+ "tempfile",
+]
+
+[[package]]
 name = "spade"
 version = "2.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

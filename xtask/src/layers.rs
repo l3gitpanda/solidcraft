@@ -114,6 +114,8 @@ pub const TABLE: &[(&str, Class)] = &[
     ("cli", Class::Exempt),
     ("quicklook", Class::Exempt),
     ("web", Class::Exempt),
+    // the server that serves the web app and lets MCP drive the tab it is open in (docs/web-mcp.md)
+    ("web-mcp", Class::Exempt),
     // the UI kit's component gallery (docs.solidcraft.io/kit/), desktop and browser
     ("ui-kit-gallery", Class::Exempt),
     ("xtask", Class::Exempt),

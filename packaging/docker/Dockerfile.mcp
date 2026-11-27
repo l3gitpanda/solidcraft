@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1
+# SolidCraft in the browser with MCP beside it (docs/web-mcp.md): one server, solidcraft-web-mcp,
+# serves the web app on port 8080, speaks MCP over HTTP at /mcp, and relays each tool call to the
+# tab a person has open, so an agent models while they watch. From the repository root:
+#
+#   docker build -f packaging/docker/Dockerfile.mcp -t solidcraft-web-mcp .
+#   docker run --rm -p 8080:8080 -e SOLIDCRAFT_WEB_MCP_TOKEN="$(openssl rand -hex 32)" \
+#     -v solidcraft-data:/data --read-only --tmpfs /tmp solidcraft-web-mcp
+#
+# Or `docker compose -f packaging/docker/compose.mcp.yaml up -d`. The image is separate from the
+# plain web image (Dockerfile): that one stays a static site behind nginx.
+
+ARG RUST_VERSION=1.99.1
+ARG TRUNK_VERSION=0.21.14
+
+FROM rust:${RUST_VERSION}-slim-bookworm AS build
+ARG TRUNK_VERSION
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+RUN rustup target add wasm32-unknown-unknown \
+ && curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-$(uname -m)-unknown-linux-gnu.tar.gz" \
+    | tar -xz -C /usr/local/bin trunk
+WORKDIR /src
+COPY . .
+# The web app with its link to this server compiled in (the `mcp-link` feature), then the server.
+# Trunk downloads the wasm-bindgen and wasm-opt its build needs; its post-build hook writes sw.js.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    (cd apps/solidcraft-web && trunk build --release --features mcp-link) \
+ && cargo build --release --locked -p solidcraft-web-mcp \
+ && install -D target/release/solidcraft-web-mcp /out/solidcraft-web-mcp \
+ && cp -r dist/web /out/site
+# A compressed copy beside each file worth compressing: the server sends it to browsers that take
+# gzip, as nginx would compress on the way out.
+RUN find /out/site -type f \( -name '*.wasm' -o -name '*.js' -o -name '*.css' -o -name '*.html' -o -name '*.json' -o -name '*.svg' -o -name '*.webmanifest' \) \
+    -size +1k -exec gzip -9 -k {} +
+
+FROM debian:bookworm-slim
+RUN useradd --system --uid 10001 --user-group --home-dir /data --shell /usr/sbin/nologin solidcraft \
+ && install -d -o solidcraft -g solidcraft /data
+COPY LICENSE-MIT LICENSE-APACHE NOTICE THIRD-PARTY-LICENSES.txt /usr/share/doc/solidcraft/
+COPY --from=build /out/solidcraft-web-mcp /usr/local/bin/solidcraft-web-mcp
+COPY --from=build /out/site/ /srv/solidcraft/
+# Where it listens inside the container, the site, and the one folder agents' files live in
+# (designs, exports, pictures): mount a volume there to keep them.
+ENV SOLIDCRAFT_WEB_MCP_LISTEN=0.0.0.0:8080 \
+    SOLIDCRAFT_WEB_MCP_SITE=/srv/solidcraft \
+    SOLIDCRAFT_WEB_MCP_DATA=/data \
+    HOME=/data
+USER 10001:10001
+VOLUME /data
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s CMD ["solidcraft-web-mcp", "--healthcheck"]
+ENTRYPOINT ["solidcraft-web-mcp"]
