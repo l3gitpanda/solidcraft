@@ -40,7 +40,10 @@ export SOLIDCRAFT_WEB_MCP_TOKEN="$(openssl rand -hex 32)"
 docker compose -f packaging/docker/compose.mcp.yaml up -d --build
 ```
 
-The first build compiles the web app and the server, which takes a while. Then:
+The first build compiles the web app and the server, which takes a while (an hour or more on
+four cores) and a lot of memory: packaging the web app (Trunk's `wasm-bindgen` step) needs about
+20 GB of RAM and swap together, and is killed part-way with less. On a smaller server, build the
+image on a bigger computer and move it over with `docker save` and `docker load`. Then:
 
 1. Open `http://localhost:8080/#mcp-token=<the token>` once. The tab keeps the token in the
    browser's storage and takes it out of the address; later visits to `http://localhost:8080/`
@@ -147,7 +150,8 @@ its copy has arrived complete, so a save cut short leaves the earlier file as it
 The addition is contained so that merging upstream stays easy:
 
 - new: `apps/solidcraft-web-mcp/` (the server), `apps/solidcraft-web/src/mcp_link.rs` (the tab's
-  side), `packaging/docker/Dockerfile.mcp`, `packaging/docker/compose.mcp.yaml`, this page;
+  side), `packaging/docker/Dockerfile.mcp` and its `.dockerignore`, `packaging/docker/compose.mcp.yaml`,
+  this page;
 - touched: `apps/solidcraft-web/src/main.rs` (a `mod` line and one call, both behind the
   feature), `apps/solidcraft-web/Cargo.toml` (the feature), `xtask/src/layers.rs` (the new
   crate's row), `crates/ui-egui/src/control.rs` (one line: `ui.render` writes its picture

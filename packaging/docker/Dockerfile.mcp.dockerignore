@@ -1,0 +1,7 @@
+# Build context for packaging/docker/Dockerfile.mcp (the repository root): the sources the web
+# app and the server need, without build output, git history or local files.
+.git
+**/target*
+dist
+plan
+docs/screenshots
