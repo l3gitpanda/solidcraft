@@ -28,6 +28,8 @@ struct Tab {
     /// The app's version, as its hello said.
     version: String,
     since: Instant,
+    /// Whether a request has been sent on to it yet.
+    driven: bool,
 }
 
 /// A request sent to a tab and not yet collected by its caller.
@@ -103,7 +105,7 @@ impl Hub {
         let mut state = self.state();
         state.last_tab += 1;
         let id = state.last_tab;
-        state.tabs.push(Tab { id, writer, hidden, version, since: Instant::now() });
+        state.tabs.push(Tab { id, writer, hidden, version, since: Instant::now(), driven: false });
         self.moved.notify_all();
         id
     }
@@ -133,6 +135,11 @@ impl Hub {
             flight.reply = Some(reply);
             self.moved.notify_all();
         }
+    }
+
+    /// Whether the request about to be sent on to tab `tab` is its first: true once for each tab.
+    pub fn first_call(&self, tab: u64) -> bool {
+        self.state().tabs.iter_mut().find(|t| t.id == tab).is_some_and(|t| !std::mem::replace(&mut t.driven, true))
     }
 
     /// The driven tab's id, if a tab is linked.

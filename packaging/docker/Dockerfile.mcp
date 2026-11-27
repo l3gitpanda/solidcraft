@@ -26,11 +26,13 @@ WORKDIR /src
 COPY . .
 # The web app with its link to this server compiled in (the `mcp-link` feature), then the server.
 # Trunk downloads the wasm-bindgen and wasm-opt its build needs; its post-build hook writes sw.js.
+# The server goes in without its line tables (some 300 MB instead of 1.3 GB); backtraces keep function names.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     (cd apps/solidcraft-web && trunk build --release --features mcp-link) \
  && cargo build --release --locked -p solidcraft-web-mcp \
- && install -D target/release/solidcraft-web-mcp /out/solidcraft-web-mcp \
+ && install -d /out \
+ && strip --strip-debug -o /out/solidcraft-web-mcp target/release/solidcraft-web-mcp \
  && cp -r dist/web /out/site
 # A compressed copy beside each file worth compressing: the server sends it to browsers that take
 # gzip, as nginx would compress on the way out.

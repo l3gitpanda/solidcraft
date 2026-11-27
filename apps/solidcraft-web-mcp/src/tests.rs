@@ -557,7 +557,11 @@ fn a_tool_call_runs_in_the_tab_and_its_result_comes_back() {
         assert!(reply(&made) == json!({"created": "Body 1", "size": [30, 20, 10]}), "{made}");
     }
     assert_eq!(tab.commands(), ["solid.box", "solid.box"]);
-    assert_eq!(tab.seen.lock().unwrap()[0].1, json!({"command": "solid.box", "params": {"size": [30, 20, 10]}}));
+    // The first call to reach a tab takes it off the Home page, once; then the call itself.
+    let seen = tab.seen.lock().unwrap().clone();
+    assert_eq!(seen[0], ("ui.home".to_string(), json!({"open": false})), "{seen:?}");
+    assert_eq!(seen[1].1, json!({"command": "solid.box", "params": {"size": [30, 20, 10]}}));
+    assert_eq!(seen.iter().filter(|(method, _)| method == "ui.home").count(), 1, "{seen:?}");
     // The tab's own refusal is the tool's error.
     let refused = client.call("execute", json!({"command": "no.such"}));
     assert!(failed(&refused) && text(&refused).contains("unknown command `no.such`"), "{refused}");

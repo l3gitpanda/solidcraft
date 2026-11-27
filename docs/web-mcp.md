@@ -132,6 +132,9 @@ its copy has arrived complete, so a save cut short leaves the earlier file as it
 - **Keep the tab visible.** A browser pauses a hidden tab (a background tab, a minimised
   window), and requests wait until it is shown again. A window of its own is enough; it need
   not have the focus. A tool result says so when the linked tab is hidden.
+- **The first call leaves the Home page.** The app starts on Home, which covers the design; the
+  first call to reach a tab closes it, so you see what is being built. After that Home is yours
+  to open and close.
 - **One tab is driven:** the one that linked last. Opening the app in a second window moves the
   agents to it; closing it moves them back. A call already running stays with the tab it began
   in, files and all.
