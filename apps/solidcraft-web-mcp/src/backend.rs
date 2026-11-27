@@ -280,6 +280,14 @@ impl TabBackend {
         // The tab driven now is this call's tab to its end: its files go there, its request runs
         // there and its files come back from there, whatever links meanwhile.
         let Some(tab) = self.hub.active() else { return Err(no_tab(&self.url)) };
+        // The app starts on its Home page, which covers the design. The first call to reach a tab
+        // closes that page, so a person watching sees what is built; after that it is theirs to
+        // open again. The tab runs its requests in order, so the answer is not waited for.
+        if self.hub.first_call(tab)
+            && let Ok(ticket) = self.hub.send(tab, json!({"method": "ui.home", "params": {"open": false}}), "leaving the Home page")
+        {
+            self.hub.forget(ticket.id);
+        }
         if syncs {
             synced.push(&mut self.link(tab, self.waits.file), &params).map_err(|e| format!("{what} was not sent: {e}"))?;
         }
