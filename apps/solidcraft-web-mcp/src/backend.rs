@@ -84,21 +84,22 @@ pub struct TabBackend {
     settled: Option<Settled>,
 }
 
-/// The tab, as the file copies reach it.
+/// One tab, as the file copies reach it.
 struct Link<'a> {
     hub: &'a Hub,
+    tab: u64,
     wait: Duration,
     step: Duration,
 }
 
 impl Tab for Link<'_> {
-    fn id(&self) -> Option<u64> {
-        self.hub.active()
+    fn id(&self) -> u64 {
+        self.tab
     }
 
     fn file(&mut self, message: Value) -> Result<Value, String> {
         let what = format!("a file {}", message.get("fs").and_then(Value::as_str).unwrap_or("message"));
-        let ticket = self.hub.send(message, &what).map_err(|e| match e {
+        let ticket = self.hub.send(self.tab, message, &what).map_err(|e| match e {
             SendError::NoTab => "the browser tab closed or reloaded while its files were being copied".to_string(),
             SendError::Write(e) => format!("the browser tab stopped answering while its files were being copied ({e})"),
         })?;
@@ -128,8 +129,8 @@ impl TabBackend {
         self
     }
 
-    fn link(&self, wait: Duration) -> Link<'_> {
-        Link { hub: &self.hub, wait, step: self.waits.step }
+    fn link(&self, tab: u64, wait: Duration) -> Link<'_> {
+        Link { hub: &self.hub, tab, wait, step: self.waits.step }
     }
 
     /// The folders whose files come back from the tab: the agent's, as the call's scope has
@@ -146,10 +147,10 @@ impl TabBackend {
         roots
     }
 
-    /// Bring back what a finished request wrote.
-    fn pull(&self, synced: &mut Synced) -> Result<(), String> {
+    /// Bring back what a finished request wrote, from the tab that ran it.
+    fn pull(&self, synced: &mut Synced, tab: u64) -> Result<(), String> {
         let scratch = solidcraft_mcp::scratch_dir().map(|d| d.to_string_lossy().into_owned());
-        synced.pull(&mut self.link(self.waits.file), &self.roots(scratch.as_deref()), scratch.as_deref())
+        synced.pull(&mut self.link(tab, self.waits.file), &self.roots(scratch.as_deref()), scratch.as_deref())
     }
 
     /// Wait for `ticket` up to `timeout`, reporting progress and minding the cancellation flag.
@@ -168,7 +169,7 @@ impl TabBackend {
                 reported = secs / 10;
                 if let Some(progress) = &self.progress {
                     let hidden =
-                        if self.hub.active_hidden() { "; the tab is hidden, so the browser has paused it: bring it to the front" } else { "" };
+                        if self.hub.hidden(ticket.tab) { "; the tab is hidden, so the browser has paused it: bring it to the front" } else { "" };
                     progress.report(secs as f64, None, Some(&format!("{what} is running in the browser tab ({secs} s{hidden})")));
                 }
             }
@@ -180,7 +181,7 @@ impl TabBackend {
     /// The error for a request still running after its wait, in the desktop bridge's words.
     fn still_running(&self, o: &Outstanding, earlier: bool) -> String {
         let secs = o.since.elapsed().as_secs();
-        let hidden = if self.hub.active_hidden() {
+        let hidden = if self.hub.hidden(o.ticket.tab) {
             " The tab is hidden, and a browser pauses a hidden tab: bring it to the front (a window of its own is enough)."
         } else {
             ""
@@ -211,7 +212,7 @@ impl TabBackend {
             (Waited::Reply(reply), _) => {
                 if o.syncs {
                     // Its files, late: a failure here is the earlier request's, not this call's.
-                    let _ = self.pull(&mut self.hub.turn());
+                    let _ = self.pull(&mut self.hub.turn(), o.ticket.tab);
                 }
                 self.settled = Some(Settled::Finished { what: o.what, reply });
                 Ok(())
@@ -246,7 +247,7 @@ impl TabBackend {
         match self.wait(o.ticket, &o.what, o.since, self.waits.settle) {
             (Waited::Reply(mut reply), _) => {
                 if o.syncs
-                    && let Err(e) = self.pull(&mut self.hub.turn())
+                    && let Err(e) = self.pull(&mut self.hub.turn(), o.ticket.tab)
                     && reply.get("ok").and_then(Value::as_bool) == Some(true)
                 {
                     reply = json!({"ok": false, "error": format!("it ran, but its files could not be copied from the browser tab: {e}")});
@@ -272,13 +273,13 @@ impl TabBackend {
         let syncs = touches_files(method);
         let hub = self.hub.clone();
         let mut synced = hub.turn();
-        if self.hub.active().is_none() {
-            return Err(no_tab(&self.url));
-        }
+        // The tab driven now is this call's tab to its end: its files go there, its request runs
+        // there and its files come back from there, whatever links meanwhile.
+        let Some(tab) = self.hub.active() else { return Err(no_tab(&self.url)) };
         if syncs {
-            synced.push(&mut self.link(self.waits.file), &params).map_err(|e| format!("{what} was not sent: {e}"))?;
+            synced.push(&mut self.link(tab, self.waits.file), &params).map_err(|e| format!("{what} was not sent: {e}"))?;
         }
-        let ticket = self.hub.send(json!({"method": method, "params": params}), &what).map_err(|e| match e {
+        let ticket = self.hub.send(tab, json!({"method": method, "params": params}), &what).map_err(|e| match e {
             SendError::NoTab => no_tab(&self.url),
             SendError::Write(e) => format!("{}; the tab's link broke as the call was sent ({e})", no_tab(&self.url)),
         })?;
@@ -287,7 +288,7 @@ impl TabBackend {
             (Waited::Reply(reply), _) => {
                 let result = outcome(&reply)?;
                 if syncs {
-                    self.pull(&mut synced).map_err(|e| format!("{what} ran, but its files could not be copied from the browser tab: {e}"))?;
+                    self.pull(&mut synced, tab).map_err(|e| format!("{what} ran, but its files could not be copied from the browser tab: {e}"))?;
                 }
                 Ok(result)
             }

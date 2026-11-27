@@ -578,6 +578,36 @@ fn the_tab_linked_last_is_the_one_driven() {
 }
 
 #[test]
+fn a_call_keeps_to_the_tab_it_began_in_when_another_links() {
+    let fixture = relay();
+    let first = FakeTab::link(
+        &fixture,
+        Box::new(|_, params, files| match params["command"].as_str() {
+            Some("file.export") => {
+                files.lock().unwrap().insert(params["params"]["path"].as_str().unwrap().to_string(), b"from the first tab".to_vec());
+                Answer::Later(Duration::from_millis(400), json!({"ok": true, "result": {"exported": true}}))
+            }
+            _ => ok(json!({})),
+        }),
+    );
+    let mut client = Client::open(fixture.addr);
+    let out = path_text(&fixture.data.join("part.step"));
+    let (result, second) = std::thread::scope(|scope| {
+        let call = scope.spawn(|| client.call("execute", json!({"command": "file.export", "params": {"path": out}})));
+        until("the first tab to get the request", || !first.commands().is_empty());
+        // A second window opens while the export runs: it is the one driven from now on.
+        let second = FakeTab::plain(&fixture);
+        second.files.lock().unwrap().insert(out.clone(), b"an older file in the second tab".to_vec());
+        (call.join().unwrap(), second)
+    });
+    assert!(!failed(&result), "{result}");
+    assert_eq!(std::fs::read(&out).unwrap(), b"from the first tab", "the export comes back from the tab that made it");
+    // The next call goes to the second tab.
+    client.call("execute", json!({"command": "solid.box"}));
+    assert_eq!(second.commands(), ["solid.box"]);
+}
+
+#[test]
 fn a_tab_that_goes_mid_call_takes_the_call_with_it() {
     let fixture = relay();
     let tab = FakeTab::link(&fixture, Box::new(|_, _, _| Answer::Silent));
@@ -716,6 +746,13 @@ fn files_a_call_names_go_to_the_tab_and_what_the_tab_writes_comes_back() {
     let exported = client.call("execute", json!({"command": "file.export", "params": {"path": out}}));
     assert!(!failed(&exported), "{exported}");
     assert_eq!(std::fs::read(&out).unwrap(), vec![7; 100_000]);
+    // Written over an existing file, the new bytes replace it whole and nothing else is left beside it.
+    std::fs::write(&out, "an earlier export").unwrap();
+    client.call("execute", json!({"command": "file.export", "params": {"path": out}}));
+    assert_eq!(std::fs::read(&out).unwrap(), vec![7; 100_000]);
+    let beside: Vec<String> =
+        std::fs::read_dir(fixture.data.join("out")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(beside, ["part.step"]);
     assert!(!Path::new(&stray).exists(), "outside the agent's folders");
     // A path outside them is not sent to the tab either.
     std::fs::write(&stray, "private").unwrap();

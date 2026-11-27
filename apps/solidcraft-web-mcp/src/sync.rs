@@ -69,15 +69,14 @@ pub fn named_paths(params: &Value) -> Vec<String> {
 
 /// How the copies reach the tab: one file message and its answer.
 pub trait Tab {
-    /// The driven tab's id.
-    fn id(&self) -> Option<u64>;
+    /// The tab's id.
+    fn id(&self) -> u64;
     /// Send a file message (`{"fs": …}`) and wait for its result.
     fn file(&mut self, message: Value) -> Result<Value, String>;
 }
 
 impl Synced {
-    fn for_tab(&mut self, tab: Option<u64>) {
-        let tab = tab.unwrap_or(0);
+    fn for_tab(&mut self, tab: u64) {
         if self.tab != tab {
             self.tab = tab;
             self.files.clear();
@@ -151,7 +150,11 @@ impl Synced {
             if let Some(parent) = Path::new(path).parent().and_then(Path::to_str).filter(|p| !p.is_empty()) {
                 vfs::create_new_dir_all(parent).map_err(|e| format!("{parent}: {e}"))?;
             }
-            vfs::write(path, &bytes).map_err(|e| format!("{path}: {e}"))?;
+            // Whole or not at all: a copy cut short (a full disk, the server stopped) leaves the
+            // file that was there, a saved design above all, as it was.
+            vfs::check(path)
+                .and_then(|()| solidcraft_engine::io::write_atomic(Path::new(path), &bytes, false))
+                .map_err(|e| format!("{path}: {e}"))?;
             self.files.insert(path.to_string(), Entry { here: vfs::stamp(path), digest: digest.to_string() });
         }
         if !spent.is_empty() {

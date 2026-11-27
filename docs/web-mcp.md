@@ -121,7 +121,8 @@ volume. Paths outside the data folder are refused, as `solidcraft-cli mcp --allo
 them. The tab's own storage (`/opfs/…`, a design opened from the computer) is untouched: a
 person can still open and save designs in the browser as usual.
 
-Files are copied whole, in 4 MiB pieces, up to 512 MiB each.
+Files are copied whole, in 4 MiB pieces, up to 512 MiB each. A file on disk is replaced only once
+its copy has arrived complete, so a save cut short leaves the earlier file as it was.
 
 ## What to expect
 
@@ -129,7 +130,8 @@ Files are copied whole, in 4 MiB pieces, up to 512 MiB each.
   window), and requests wait until it is shown again. A window of its own is enough; it need
   not have the focus. A tool result says so when the linked tab is hidden.
 - **One tab is driven:** the one that linked last. Opening the app in a second window moves the
-  agents to it; closing it moves them back.
+  agents to it; closing it moves them back. A call already running stays with the tab it began
+  in, files and all.
 - **No tab, no call.** With no tab linked, a tool call fails at once with a message that names
   the address to open. Nothing runs headless in the server.
 - **A reload ends the session in the tab.** A request running then is lost, and the tool says
@@ -148,7 +150,8 @@ The addition is contained so that merging upstream stays easy:
   side), `packaging/docker/Dockerfile.mcp`, `packaging/docker/compose.mcp.yaml`, this page;
 - touched: `apps/solidcraft-web/src/main.rs` (a `mod` line and one call, both behind the
   feature), `apps/solidcraft-web/Cargo.toml` (the feature), `xtask/src/layers.rs` (the new
-  crate's row), `Cargo.lock` (the new crate; no new third-party crates).
+  crate's row), `crates/ui-egui/src/control.rs` (one line: `ui.render` writes its picture
+  through `vfs`, so a tab can keep it), `Cargo.lock` (the new crate; no new third-party crates).
 
 The server uses `solidcraft-mcp`'s public API (`Server`, `Backend`), so a change to those
 upstream shows up as a compile error in `apps/solidcraft-web-mcp/src/backend.rs` or `mcp.rs`.

@@ -145,12 +145,18 @@ impl Hub {
         self.state().active().is_some_and(|t| t.hidden)
     }
 
-    /// Send `message` (an object; its `id` is set here) to the driven tab. `what` names the
-    /// request for people (`control.running`, the errors).
-    pub fn send(&self, mut message: Value, what: &str) -> Result<Ticket, SendError> {
+    /// Whether tab `tab`'s page is hidden (a tab that is gone is not).
+    pub fn hidden(&self, tab: u64) -> bool {
+        self.state().tabs.iter().any(|t| t.id == tab && t.hidden)
+    }
+
+    /// Send `message` (an object; its `id` is set here) to tab `tab`, driven or not: a call's
+    /// file copies and its request all go to the one tab the call began with, whatever links
+    /// meanwhile. `what` names the request for people (`control.running`, the errors).
+    pub fn send(&self, tab: u64, mut message: Value, what: &str) -> Result<Ticket, SendError> {
         let (ticket, writer) = {
             let mut state = self.state();
-            let Some((tab, writer)) = state.active().map(|t| (t.id, t.writer.clone())) else { return Err(SendError::NoTab) };
+            let Some(writer) = state.tabs.iter().find(|t| t.id == tab).map(|t| t.writer.clone()) else { return Err(SendError::NoTab) };
             state.last_request += 1;
             let id = state.last_request;
             state.flights.insert(id, Flight { tab, what: what.to_string(), since: Instant::now(), reply: None, lost: false });

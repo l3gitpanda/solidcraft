@@ -1680,7 +1680,8 @@ fn ui_render(app: &mut SolveApp, q: params::Render) -> Outcome {
     // What drew it (gpu, gpu-software or cpu), and the warning a CPU render carries.
     let (renderer, warning) = (png.renderer, solidcraft_engine::capture::warning(png.renderer));
     match q.path {
-        Some(path) => match vfs::check(&path).and_then(|()| std::fs::write(&path, &png.bytes)) {
+        // Through `vfs`: the disk on the desktop (checked as before), the tab's memory in the browser.
+        Some(path) => match vfs::write(&path, &png.bytes) {
             Ok(()) => ok(json!({"path": path, "bytes": png.bytes.len(), "renderer": renderer, "warning": warning})),
             Err(e) => err(e),
         },
