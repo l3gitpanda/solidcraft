@@ -154,7 +154,8 @@ The addition is contained so that merging upstream stays easy:
 
 - new: `apps/solidcraft-web-mcp/` (the server), `apps/solidcraft-web/src/mcp_link.rs` (the tab's
   side), `packaging/docker/Dockerfile.mcp` and its `.dockerignore`, `packaging/docker/compose.mcp.yaml`,
-  this page;
+  `.github/workflows/fork-upstream-sync.yml` and `scripts/fork/` (the nightly sync, below), this
+  page;
 - touched: `apps/solidcraft-web/src/main.rs` (a `mod` line and one call, both behind the
   feature), `apps/solidcraft-web/Cargo.toml` (the feature), `xtask/src/layers.rs` (the new
   crate's row), `crates/ui-egui/src/control.rs` (one line: `ui.render` writes its picture
@@ -163,3 +164,35 @@ The addition is contained so that merging upstream stays easy:
 The server uses `solidcraft-mcp`'s public API (`Server`, `Backend`), so a change to those
 upstream shows up as a compile error in `apps/solidcraft-web-mcp/src/backend.rs` or `mcp.rs`.
 `cargo test -p solidcraft-web-mcp` runs the server against a stand-in tab.
+
+### The nightly sync
+
+`.github/workflows/fork-upstream-sync.yml` keeps the fork's `main` following upstream's without
+anyone pressing "Sync fork". Each night (09:23 UTC, or at once from the Actions tab: *Fork
+upstream sync*, *Run workflow*) it:
+
+1. turns off upstream's own workflows in the fork and cancels their waiting runs
+   (`scripts/fork/quiet-upstream-workflows.sh`). They ask for upstream's paid runners, which the
+   fork does not have, so they only ever sat queued. The fork's own workflows (`fork-*.yml`)
+   stay on, as does any file named in the repository variable `SYNC_KEEP_WORKFLOWS`;
+2. merges upstream's `main` into the fork's (`scripts/fork/merge-upstream.sh`). A clash in
+   `Cargo.lock` alone is settled by taking upstream's lockfile and letting cargo add this
+   page's crate back, so upstream's versions are kept;
+3. checks the addition still holds: `cargo clippy -p solidcraft-web-mcp --all-targets -- -D
+   warnings`, `cargo test -p solidcraft-web-mcp`, and `cargo check -p solidcraft-web --target
+   wasm32-unknown-unknown --features mcp-link`;
+4. pushes the merge to `main` (never forced).
+
+When the merge clashes or a check fails, `main` is left alone and the run opens a pull request
+from the `upstream-sync` branch, then fails, so GitHub emails about it. Resolve or fix it on
+that branch and merge; until that pull request is merged or closed, later runs wait for it.
+
+It needs one secret, because GitHub's built-in token may not push upstream's changes to
+`.github/workflows/`. Create a fine-grained personal access token (GitHub, Settings, Developer
+settings, Fine-grained tokens) for this repository only, with **Contents**, **Workflows**,
+**Pull requests** and **Actions** set to *Read and write*, and save it as the repository secret
+`SYNC_TOKEN` (the repository's Settings, Secrets and variables, Actions). Without it the run
+stops at once and says so. When the token expires, the run fails the same way: make a new one.
+
+The sync updates the source only. The Docker image is not rebuilt by it: rebuild with
+`docker compose -f packaging/docker/compose.mcp.yaml up -d --build` after pulling.
