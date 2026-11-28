@@ -1,0 +1,166 @@
+# The fork's own workflow (l3gitpanda/solidcraft), not upstream's: each night it merges upstream's
+# main into the fork's main, checks that the web MCP relay still builds and passes its tests, and
+# pushes. A merge that clashes, or a check that fails, goes to a pull request from the
+# `upstream-sync` branch instead, and main is left alone. See docs/web-mcp.md, "Keeping up with
+# upstream", for the token it needs and what to do with such a pull request.
+name: Fork upstream sync
+
+on:
+  schedule:
+    - cron: "23 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-upstream-sync
+  cancel-in-progress: false
+
+env:
+  SYNC_BRANCH: upstream-sync
+  UPSTREAM_URL: https://github.com/tangency-labs/solidcraft.git
+  UPSTREAM_REF: main
+
+jobs:
+  gate:
+    name: Ready to sync
+    if: github.repository != 'tangency-labs/solidcraft'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      waiting: ${{ steps.open.outputs.pr }}
+    env:
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+      SYNC_KEEP_WORKFLOWS: ${{ vars.SYNC_KEEP_WORKFLOWS }}
+    steps:
+      - name: Need the SYNC_TOKEN secret
+        if: env.GH_TOKEN == ''
+        run: |
+          echo "::error::Add a repository secret named SYNC_TOKEN: a fine-grained token for this repository with Contents, Workflows, Pull requests and Actions set to read and write. See docs/web-mcp.md, 'Keeping up with upstream'."
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          sparse-checkout: scripts/fork
+          persist-credentials: false
+      - name: Turn off upstream's workflows here
+        continue-on-error: true
+        run: scripts/fork/quiet-upstream-workflows.sh
+      - name: Wait while an earlier sync is in a pull request
+        id: open
+        run: |
+          pr="$(gh pr list -R "$GITHUB_REPOSITORY" --head "$SYNC_BRANCH" --state open --json url --jq '.[0].url // ""')"
+          echo "pr=$pr" >>"$GITHUB_OUTPUT"
+          if [ -n "$pr" ]; then
+            echo "::warning::An earlier sync is waiting in $pr. Merge or close it, and the next run carries on from there."
+            echo "Waiting on $pr: merge or close it and the next run carries on." >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+  sync:
+    name: Merge, check and push
+    needs: gate
+    if: needs.gate.outputs.waiting == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      SYNC_KEEP_WORKFLOWS: ${{ vars.SYNC_KEEP_WORKFLOWS }}
+    steps:
+      - name: Make room for the build (the runner's preinstalled SDKs it does not use)
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+      - name: Name the merge's author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Install the repository's Rust
+        run: rustup toolchain install && rustup target add wasm32-unknown-unknown && rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: fork-upstream-sync
+      - name: Merge upstream
+        id: merge
+        run: scripts/fork/merge-upstream.sh
+      - name: Nothing new upstream
+        if: steps.merge.outputs.status == 'current'
+        run: echo "Already up to date with upstream ${UPSTREAM_REF}." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # A clash: put upstream's main on the sync branch and open a pull request into main, where
+      # GitHub shows the clashing files (and can often resolve them in the browser).
+      - name: Hand a clash to a pull request
+        if: steps.merge.outputs.status == 'conflict'
+        env:
+          UPSTREAM: ${{ steps.merge.outputs.upstream }}
+          BEHIND: ${{ steps.merge.outputs.behind }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+        run: |
+          git push --force origin "$UPSTREAM:refs/heads/$SYNC_BRANCH"
+          {
+            echo "The nightly sync could not merge upstream's \`$UPSTREAM_REF\` ($BEHIND new commits, up to $UPSTREAM) into \`main\` on its own. These files clash:"
+            echo
+            for f in $CONFLICTS; do echo "- \`$f\`"; done
+            echo
+            echo "Resolve the conflicts (here, or locally on the \`$SYNC_BRANCH\` branch), check the relay (\`cargo test -p solidcraft-web-mcp\`), and merge. Until this pull request is merged or closed, the nightly sync waits."
+            echo
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } >body.md
+          gh pr create -R "$GITHUB_REPOSITORY" --base main --head "$SYNC_BRANCH" \
+            --title "Merge upstream: conflicts to resolve" --body-file body.md | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "::error::Upstream clashes with the fork in: $CONFLICTS"
+          exit 1
+
+      - name: Install the merged Rust (upstream may have moved it)
+        if: steps.merge.outputs.status == 'merged'
+        run: rustup toolchain install && rustup target add wasm32-unknown-unknown && rustc --version
+      - name: Clippy on the relay
+        if: steps.merge.outputs.status == 'merged'
+        run: cargo clippy -p solidcraft-web-mcp --all-targets --locked -- -D warnings
+      - name: Test the relay
+        if: steps.merge.outputs.status == 'merged'
+        run: cargo test -p solidcraft-web-mcp --locked
+      - name: Build the web app's MCP link for the browser
+        if: steps.merge.outputs.status == 'merged'
+        run: cargo check -p solidcraft-web --target wasm32-unknown-unknown --features mcp-link --locked
+
+      - name: Push to main
+        id: push
+        if: steps.merge.outputs.status == 'merged'
+        env:
+          BEHIND: ${{ steps.merge.outputs.behind }}
+          LOCKFILE: ${{ steps.merge.outputs.lockfile }}
+        run: |
+          # Not forced: if main moved during the run, this fails and the next run starts afresh.
+          git push origin HEAD:main
+          git push origin --delete "$SYNC_BRANCH" 2>/dev/null || true
+          echo "Merged $BEHIND new upstream commits into main ($(git rev-parse --short HEAD))." | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$LOCKFILE" = rebuilt ]; then echo "Cargo had to settle Cargo.lock after the merge (upstream's versions kept)." | tee -a "$GITHUB_STEP_SUMMARY"; fi
+      - name: Turn off upstream workflows the merge brought
+        if: steps.merge.outputs.status == 'merged'
+        continue-on-error: true
+        run: scripts/fork/quiet-upstream-workflows.sh
+
+      # The merge went through but a check failed: keep main as it was and put the merge in a
+      # pull request, so the failure can be fixed on the sync branch.
+      - name: Hand a failed check to a pull request
+        if: failure() && steps.merge.outputs.status == 'merged' && steps.push.outcome == 'skipped'
+        env:
+          BEHIND: ${{ steps.merge.outputs.behind }}
+          UPSTREAM: ${{ steps.merge.outputs.upstream }}
+        run: |
+          git push --force origin "HEAD:refs/heads/$SYNC_BRANCH"
+          {
+            echo "The nightly sync merged upstream's \`$UPSTREAM_REF\` ($BEHIND new commits, up to $UPSTREAM) cleanly, but a check of the relay failed, so \`main\` was not changed."
+            echo
+            echo "See the failing step in the run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "Fix it on the \`$SYNC_BRANCH\` branch and merge. Until this pull request is merged or closed, the nightly sync waits."
+          } >body.md
+          gh pr create -R "$GITHUB_REPOSITORY" --base main --head "$SYNC_BRANCH" \
+            --title "Merge upstream: the relay's checks fail" --body-file body.md | tee -a "$GITHUB_STEP_SUMMARY"
