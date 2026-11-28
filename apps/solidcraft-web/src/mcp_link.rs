@@ -104,6 +104,9 @@ pub fn under(root: &str, path: &str) -> bool {
 pub struct Library {
     pub folders: Vec<String>,
     pub designs: Vec<(String, u64)>,
+    /// Whether the list names every design the server has: a server with more lists only its
+    /// newest, and a design it leaves out may still be there.
+    pub complete: bool,
 }
 
 impl Library {
@@ -115,7 +118,8 @@ impl Library {
             .filter_map(|d| Some((d.get("path")?.as_str()?.to_string(), d.get("modified").and_then(Value::as_u64).unwrap_or(0))))
             .take(MAX_DESIGNS)
             .collect();
-        Library { folders, designs }
+        let complete = welcome.get("complete").and_then(Value::as_bool).unwrap_or(false);
+        Library { folders, designs, complete }
     }
 
     /// Whether `path` is in one of the server's folders.
@@ -125,7 +129,8 @@ impl Library {
 }
 
 /// Put the server's designs on the Home page's recent list. A design of the server's folders the
-/// server no longer has goes; one it has and the list lacks joins at the end, unless the person
+/// server no longer has goes (only when its list is complete: one left out of a list cut short
+/// may still be there); one it has and the list lacks joins at the end, unless the person
 /// removed it from the list (`forgotten`) or the list is full; one already listed keeps its place.
 /// A design that joins shows when it last changed until it is opened here.
 pub fn merge(
@@ -135,7 +140,7 @@ pub fn merge(
     library: &Library,
     max: usize,
 ) {
-    let listed = |p: &String| library.designs.iter().any(|(d, _)| d == p);
+    let listed = |p: &String| !library.complete || library.designs.iter().any(|(d, _)| d == p);
     recent.retain(|p| !library.holds(p) || listed(p));
     for (path, modified) in &library.designs {
         if recent.len() < max && library.holds(path) && !recent.contains(path) && !forgotten.contains(path) {
@@ -145,6 +150,28 @@ pub fn merge(
     }
     // A removal is kept while the server has the design, and no longer.
     forgotten.retain(|p| !library.holds(p) || listed(p));
+}
+
+/// The largest design taken from the server, as the server caps it.
+const MAX_FETCHED: usize = 512 << 20;
+
+/// Take one piece of a design the server is sending (`{path, data, append}`) into `arriving`,
+/// kept apart from the engine's files until the whole design has come: a file half there must
+/// never be seen, and copied back to the server, by an agent's call running meanwhile.
+pub fn take_piece(arriving: &mut std::collections::HashMap<String, Vec<u8>>, piece: &Value) -> Result<(), String> {
+    let path = piece.get("path").and_then(Value::as_str).ok_or("missing `path`")?;
+    let mut bytes = decode(piece.get("data").and_then(Value::as_str).unwrap_or_default()).ok_or("`data` is not base64")?;
+    if piece.get("append").and_then(Value::as_bool) == Some(true) {
+        let held = arriving.get_mut(path).ok_or("a piece came without the start of its design")?;
+        if held.len() + bytes.len() > MAX_FETCHED {
+            arriving.remove(path);
+            return Err("larger than 512 MiB".into());
+        }
+        held.append(&mut bytes);
+    } else {
+        arriving.insert(path.to_string(), bytes);
+    }
+    Ok(())
 }
 
 /// The engine's in-memory files, as the file messages use them.
@@ -298,8 +325,8 @@ mod web {
     use wasm_bindgen::{JsCast as _, JsValue, closure::Closure};
 
     use super::{
-        FOLDERS_KEY, Incoming, Library, Store, TOKEN_KEY, UPLOAD_CHUNK, encode, file_reply, incoming, link_url, merge, token_in_fragment, under,
-        with_id,
+        FOLDERS_KEY, Incoming, Library, Store, TOKEN_KEY, UPLOAD_CHUNK, encode, file_reply, incoming, link_url, merge, take_piece, token_in_fragment,
+        under, with_id,
     };
 
     /// The engine's in-memory files.
@@ -355,6 +382,9 @@ mod web {
         /// Saves sent to the server and not answered yet: their number, and the promise's resolve.
         saves: RefCell<std::collections::HashMap<u64, Function>>,
         last_save: Cell<u64>,
+        /// Designs on their way from the server, by path: kept out of the engine's files until
+        /// whole ([`take_piece`]).
+        arriving: RefCell<std::collections::HashMap<String, Vec<u8>>>,
     }
 
     /// How long a save waits for the server to say it wrote the design.
@@ -382,7 +412,7 @@ mod web {
         if link.linked.get() {
             link.send(&json!({"fetch": {"path": path}}).to_string());
         } else {
-            link.say(format!("{path} is on SolidCraft's server, which this tab is not linked to now: try again in a moment"), true);
+            link.say(solidcraft_ui_text::tr("web.mcp.open_unlinked").replace("{path}", path), true);
         }
         true
     }
@@ -393,7 +423,7 @@ mod web {
     pub async fn save(path: &str, bytes: &[u8]) -> Result<(), String> {
         let Some(link) = the_link().filter(|link| link.owns(path)) else { return Ok(()) };
         if !link.linked.get() {
-            return Err("not saved on SolidCraft's server: this tab is not linked to it now, so the design is only in this tab".into());
+            return Err(solidcraft_ui_text::tr("web.mcp.save_unlinked").to_string());
         }
         let number = link.last_save.get() + 1;
         link.last_save.set(number);
@@ -410,7 +440,7 @@ mod web {
         }
         // Saves are written one after another: one the server never answers must not hold up
         // the rest for ever.
-        let late = JsValue::from_str("may not be saved on SolidCraft's server: it did not answer within five minutes");
+        let late = JsValue::from_str(solidcraft_ui_text::tr("web.mcp.save_unanswered"));
         let timer = js_sys::Promise::new(&mut |done, _| {
             if let Some(window) = web_sys::window() {
                 let _ = window.set_timeout_with_callback_and_timeout_and_arguments_1(&done, SAVE_WAIT_MS, &late);
@@ -420,7 +450,7 @@ mod web {
         link.saves.borrow_mut().remove(&number);
         match answer {
             Ok(answer) => answer.as_string().map_or(Ok(()), Err),
-            Err(_) => Err("not saved on SolidCraft's server: its answer was lost".into()),
+            Err(_) => Err(solidcraft_ui_text::tr("web.mcp.save_lost").to_string()),
         }
     }
 
@@ -505,10 +535,11 @@ mod web {
         fn closed(&self) {
             *self.socket.borrow_mut() = None;
             self.linked.set(false);
+            self.arriving.borrow_mut().clear();
             // Saves the server had not answered may not have reached its disk.
             let unanswered: Vec<u64> = self.saves.borrow().keys().copied().collect();
             for number in unanswered {
-                self.answer_save(number, Some("may not be saved on SolidCraft's server: the link to it broke before it answered".into()));
+                self.answer_save(number, Some(solidcraft_ui_text::tr("web.mcp.save_link_broke").to_string()));
             }
             // The requests the server was waiting for are lost to it; their replies go nowhere.
             self.pending.borrow_mut().clear();
@@ -548,19 +579,24 @@ mod web {
                     self.ctx.request_repaint();
                 }
                 Incoming::Piece(piece) => {
-                    let write = json!({"fs": "write", "path": piece.get("path"), "data": piece.get("data"), "append": piece.get("append")});
-                    let reply = file_reply(&mut Files, &write);
-                    if reply["ok"] != true {
-                        log::warn!("MCP link: a design from the server could not be kept: {}", reply["error"]);
+                    if let Err(e) = take_piece(&mut self.arriving.borrow_mut(), &piece) {
+                        log::warn!("MCP link: a design from the server could not be kept: {e}");
                     }
                 }
-                Incoming::Fetched { path, error: None } if vfs::exists(&path) => {
-                    self.opened.borrow_mut().push(path);
-                    self.ctx.request_repaint();
-                }
                 Incoming::Fetched { path, error } => {
-                    let why = error.unwrap_or_else(|| "it did not arrive whole".into());
-                    self.say(format!("{path} could not be opened from SolidCraft's server: {why}"), true);
+                    // Whole now: only here does it join the engine's files, to be opened.
+                    let arrived = self.arriving.borrow_mut().remove(&path);
+                    match (arrived, error) {
+                        (Some(bytes), None) => {
+                            vfs::insert(&path, bytes);
+                            self.opened.borrow_mut().push(path);
+                            self.ctx.request_repaint();
+                        }
+                        (_, error) => {
+                            let why = error.unwrap_or_else(|| solidcraft_ui_text::tr("web.mcp.not_whole").to_string());
+                            self.say(solidcraft_ui_text::tr("web.mcp.open_failed").replace("{path}", &path).replace("{error}", &why), true);
+                        }
+                    }
                 }
                 Incoming::Saved { number, error } => self.answer_save(number, error),
                 Incoming::Refused => {
@@ -649,6 +685,7 @@ mod web {
             messages: RefCell::default(),
             saves: RefCell::default(),
             last_save: Cell::new(0),
+            arriving: RefCell::default(),
         });
         LINK.with(|l| *l.borrow_mut() = Some(link.clone()));
         // The handlers keep the link for the life of the page.
@@ -831,6 +868,8 @@ mod tests {
         }));
         assert_eq!(library.folders, ["/data"]);
         assert_eq!(library.designs, [("/data/new.sc".to_string(), 30), ("/data/old.sc".to_string(), 10)]);
+        assert!(!library.complete, "a welcome that does not say so may have been cut short");
+        assert!(Library::from_welcome(&json!({"complete": true})).complete);
         assert_eq!(Library::from_welcome(&json!({"tab": 1})), Library::default(), "an older server lists nothing");
     }
 
@@ -840,6 +879,7 @@ mod tests {
         let library = Library {
             folders: vec!["/data".into()],
             designs: vec![("/data/new.sc".into(), 30), ("/data/kept.sc".into(), 20), ("/data/removed.sc".into(), 10), ("/elsewhere.sc".into(), 5)],
+            complete: true,
         };
         // The browser's own designs and a remembered one of the server's keep their places; one
         // the server no longer has goes; the person's removal stands.
@@ -850,9 +890,36 @@ mod tests {
         assert_eq!(recent, ["/opfs/mine.sc", "/data/kept.sc", "/data/new.sc"]);
         assert_eq!(forgotten, ["/data/removed.sc", "/opfs/old.sc"].map(String::from).into(), "a removal lasts while the server has the design");
         assert_eq!(opened_at, BTreeMap::from([("/data/kept.sc".to_string(), 99), ("/data/new.sc".to_string(), 30)]));
+        // A list cut short drops nothing it leaves out, and keeps removals of what it leaves out.
+        let short = Library { complete: false, ..library };
+        let mut recent = vec!["/data/older.sc".to_string()];
+        let mut forgotten: BTreeSet<String> = ["/data/oldest.sc".to_string()].into();
+        merge(&mut recent, &mut forgotten, &mut BTreeMap::new(), &short, 12);
+        assert_eq!(recent, ["/data/older.sc", "/data/new.sc", "/data/kept.sc", "/data/removed.sc"]);
+        assert!(forgotten.contains("/data/oldest.sc"));
+        let library = short;
         // A full list takes no more.
         let mut full: Vec<String> = (0..12).map(|i| format!("/opfs/{i}.sc")).collect();
         merge(&mut full, &mut BTreeSet::new(), &mut BTreeMap::new(), &library, 12);
         assert!(full.iter().all(|p| p.starts_with("/opfs/")));
+    }
+
+    #[test]
+    fn a_design_from_the_server_is_held_apart_until_whole() {
+        let mut arriving = std::collections::HashMap::new();
+        take_piece(&mut arriving, &json!({"path": "/data/a.sc", "data": encode(b"hel"), "append": false})).unwrap();
+        take_piece(&mut arriving, &json!({"path": "/data/a.sc", "data": encode(b"lo"), "append": true})).unwrap();
+        assert_eq!(arriving["/data/a.sc"], b"hello");
+        // Begun again, it starts afresh.
+        take_piece(&mut arriving, &json!({"path": "/data/a.sc", "data": encode(b"new"), "append": false})).unwrap();
+        assert_eq!(arriving["/data/a.sc"], b"new");
+        for (bad, why) in [
+            (json!({"path": "/data/b.sc", "data": encode(b"x"), "append": true}), "without the start"),
+            (json!({"path": "/data/b.sc", "data": "!", "append": false}), "base64"),
+            (json!({"data": encode(b"x")}), "path"),
+        ] {
+            assert!(take_piece(&mut arriving, &bad).unwrap_err().contains(why), "{bad}");
+        }
+        assert!(!arriving.contains_key("/data/b.sc"));
     }
 }

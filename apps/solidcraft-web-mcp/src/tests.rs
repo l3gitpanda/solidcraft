@@ -886,6 +886,7 @@ fn home_lists_the_agents_designs_opens_them_and_saves_them_back() {
     // The welcome names the agent's folder and its designs, and nothing else there.
     let welcome = next_message(&mut input)["welcome"].clone();
     assert_eq!(welcome["folders"], json!([path_text(&fixture.data)]));
+    assert_eq!(welcome["complete"], true);
     let mut listed: Vec<&str> = welcome["designs"].as_array().unwrap().iter().map(|d| d["path"].as_str().unwrap()).collect();
     listed.sort_unstable();
     assert_eq!(listed, [part.as_str(), older.as_str()]);

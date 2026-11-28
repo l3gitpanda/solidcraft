@@ -39,9 +39,11 @@ pub struct Design {
     pub modified: u64,
 }
 
-/// The designs under `folders`, newest first, at most [`MAX_LISTED`]. Hidden files and folders
-/// are left out, and links to folders are not followed (no loops, nothing outside).
-pub fn designs(folders: &[PathBuf]) -> Vec<Design> {
+/// The designs under `folders`, newest first, at most [`MAX_LISTED`], and whether that is all
+/// of them (false when the list was cut short, or a folder too big to look through whole).
+/// Hidden files and folders are left out, and links to folders are not followed (no loops,
+/// nothing outside).
+pub fn designs(folders: &[PathBuf]) -> (Vec<Design>, bool) {
     fn walk(dir: &Path, depth: usize, scanned: &mut usize, out: &mut Vec<Design>) {
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         for entry in entries.flatten() {
@@ -78,16 +80,19 @@ pub fn designs(folders: &[PathBuf]) -> Vec<Design> {
     }
     out.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.path.cmp(&b.path)));
     out.dedup_by(|a, b| a.path == b.path);
+    let complete = scanned <= MAX_SCANNED && out.len() <= MAX_LISTED;
     out.truncate(MAX_LISTED);
-    out
+    (out, complete)
 }
 
-/// The welcome a tab gets once its token is taken: its id, the agent's folders and the designs
-/// in them.
+/// The welcome a tab gets once its token is taken: its id, the agent's folders, the designs in
+/// them, and whether those are all of them (the tab drops a design it does not see listed only
+/// when they are).
 pub fn welcome(tab: u64, folders: &[PathBuf]) -> Value {
-    let listed: Vec<Value> = designs(folders).into_iter().map(|d| json!({"path": d.path, "modified": d.modified})).collect();
+    let (designs, complete) = designs(folders);
+    let listed: Vec<Value> = designs.into_iter().map(|d| json!({"path": d.path, "modified": d.modified})).collect();
     let folders: Vec<String> = folders.iter().map(|f| f.to_string_lossy().into_owned()).collect();
-    json!({"welcome": {"tab": tab, "folders": folders, "designs": listed}})
+    json!({"welcome": {"tab": tab, "folders": folders, "designs": listed, "complete": complete}})
 }
 
 /// Whether a tab may read or write `path` here: a design, inside the agent's folders.
@@ -222,8 +227,17 @@ mod tests {
         at("notes.json", 5_000);
         at(".hidden/secret.sc", 6_000);
         at("a/b/c/d/e/too-deep.sc", 7_000);
-        let listed = designs(std::slice::from_ref(&root));
+        let (listed, complete) = designs(std::slice::from_ref(&root));
         assert_eq!(listed, [Design { path: new, modified: 3_000 }, Design { path: old, modified: 1_000 }]);
-        assert!(designs(&[root.join("nowhere")]).is_empty());
+        assert!(complete);
+        assert!(designs(&[root.join("nowhere")]).0.is_empty());
+        // More than a welcome lists: the newest, and word that there are more.
+        for i in 0..MAX_LISTED {
+            at(&format!("many/{i}.sc"), 10_000 + i as u64);
+        }
+        let (listed, complete) = designs(std::slice::from_ref(&root));
+        assert_eq!(listed.len(), MAX_LISTED);
+        assert!(listed.iter().all(|d| d.modified >= 10_000), "the newest are kept");
+        assert!(!complete);
     }
 }
