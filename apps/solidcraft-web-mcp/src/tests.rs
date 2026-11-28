@@ -860,3 +860,99 @@ fn files_a_call_names_go_to_the_tab_and_what_the_tab_writes_comes_back() {
     assert!(!tab.written.lock().unwrap().contains(&stray));
     assert_eq!(std::fs::read_to_string(&stray).unwrap(), "private");
 }
+
+/// The next text message the relay sends a link, as JSON.
+fn next_message(input: &mut BufReader<TcpStream>) -> Value {
+    loop {
+        let (opcode, payload) = read_server_frame(input).unwrap();
+        if opcode == 1 {
+            return serde_json::from_slice(&payload).unwrap();
+        }
+    }
+}
+
+#[test]
+fn home_lists_the_agents_designs_opens_them_and_saves_them_back() {
+    let fixture = relay();
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let part = path_text(&fixture.data.join("part.sc"));
+    std::fs::write(&part, "a design").unwrap();
+    std::fs::create_dir_all(fixture.data.join("sub")).unwrap();
+    let older = path_text(&fixture.data.join("sub").join("older.sc"));
+    std::fs::write(&older, "older").unwrap();
+    std::fs::write(fixture.data.join("part.step"), "an export").unwrap();
+    let (mut output, mut input) = link(fixture.addr, Some(TOKEN), Some(format!("http://{}", fixture.addr))).unwrap();
+
+    // The welcome names the agent's folder and its designs, and nothing else there.
+    let welcome = next_message(&mut input)["welcome"].clone();
+    assert_eq!(welcome["folders"], json!([path_text(&fixture.data)]));
+    let mut listed: Vec<&str> = welcome["designs"].as_array().unwrap().iter().map(|d| d["path"].as_str().unwrap()).collect();
+    listed.sort_unstable();
+    assert_eq!(listed, [part.as_str(), older.as_str()]);
+
+    // Opened from Home, a design comes whole, then the word that it has.
+    write_client_text(&mut output, &json!({"fetch": {"path": part}}).to_string()).unwrap();
+    let piece = next_message(&mut input);
+    assert_eq!(piece["file"]["path"], part.as_str());
+    assert_eq!(piece["file"]["append"], false);
+    assert_eq!(b64.decode(piece["file"]["data"].as_str().unwrap()).unwrap(), b"a design");
+    assert_eq!(next_message(&mut input), json!({"fetched": {"path": part}}));
+
+    // Nothing outside the agent's folder, and nothing that is not a design, is sent.
+    let outside = tempfile::tempdir().unwrap();
+    let private = path_text(&outside.path().join("private.sc"));
+    std::fs::write(&private, "private").unwrap();
+    let export = path_text(&fixture.data.join("part.step"));
+    for (path, why) in [(&private, ""), (&export, "not a design")] {
+        write_client_text(&mut output, &json!({"fetch": {"path": path}}).to_string()).unwrap();
+        let answer = next_message(&mut input);
+        assert_eq!(answer["fetched"]["path"], path.as_str(), "{answer}");
+        assert!(answer["fetched"]["error"].as_str().is_some_and(|e| e.contains(why)), "{answer}");
+    }
+
+    // A design saved in the tab is written to disk, in a new folder if need be, once whole.
+    let saved = path_text(&fixture.data.join("new").join("saved.sc"));
+    let put = |number: u64, path: &str, data: &[u8], append: bool, last: bool| {
+        json!({"put": {"ref": number, "path": path, "data": b64.encode(data), "append": append, "last": last}}).to_string()
+    };
+    write_client_text(&mut output, &put(1, &saved, b"hel", false, false)).unwrap();
+    assert!(!Path::new(&saved).exists(), "not before the last piece");
+    write_client_text(&mut output, &put(1, &saved, b"lo", true, true)).unwrap();
+    assert_eq!(next_message(&mut input), json!({"saved": {"ref": 1}}));
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), "hello");
+
+    // Outside the folder, or not a design, it is refused and nothing is written.
+    let stray = path_text(&outside.path().join("stray.sc"));
+    let text = path_text(&fixture.data.join("notes.txt"));
+    for (number, path) in [(2, &stray), (3, &text)] {
+        write_client_text(&mut output, &put(number, path, b"x", false, true)).unwrap();
+        let answer = next_message(&mut input);
+        assert_eq!(answer["saved"]["ref"], number);
+        assert!(answer["saved"]["error"].is_string(), "{answer}");
+        assert!(!Path::new(path).exists());
+    }
+    // A piece without its start is refused, not appended to anything.
+    write_client_text(&mut output, &put(4, &saved, b"tail", true, true)).unwrap();
+    assert!(next_message(&mut input)["saved"]["error"].is_string());
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), "hello");
+}
+
+#[test]
+fn a_design_saved_from_home_is_not_written_again_by_the_next_call() {
+    let fixture = relay();
+    let tab = FakeTab::plain(&fixture);
+    let design = path_text(&fixture.data.join("part.sc"));
+    let mut output = tab.socket.try_clone().unwrap();
+    let data = base64::engine::general_purpose::STANDARD.encode(b"saved in the tab");
+    write_client_text(&mut output, &json!({"put": {"ref": 1, "path": design, "data": data, "append": false, "last": true}}).to_string()).unwrap();
+    until("the save to land", || std::fs::read_to_string(&design).is_ok_and(|t| t == "saved in the tab"));
+    // The tab keeps its copy; the file then changes on disk.
+    tab.files.lock().unwrap().insert(design.clone(), b"saved in the tab".to_vec());
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(&design, "changed on disk since").unwrap();
+    // A call that saves nothing must not put the tab's copy back over the newer file.
+    let mut client = Client::open(fixture.addr);
+    client.call("execute", json!({"command": "solid.box"}));
+    assert_eq!(tab.commands(), ["solid.box"]);
+    assert_eq!(std::fs::read_to_string(&design).unwrap(), "changed on disk since");
+}

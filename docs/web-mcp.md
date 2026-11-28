@@ -130,6 +130,24 @@ person can still open and save designs in the browser as usual.
 Files are copied whole, in 4 MiB pieces, up to 512 MiB each. A file on disk is replaced only once
 its copy has arrived complete, so a save cut short leaves the earlier file as it was.
 
+### Recent designs
+
+The app's Home page lists the designs this browser holds. The agents' designs are on the
+server's disk instead, so the server tells each tab about them as it links: the designs under
+the data folder (`.sc` and older design files, newest first, at most 50, four folders deep at
+most, hidden ones left out) join the end of **Recent designs**, each showing when it last
+changed. A design already listed keeps its place, one removed from the list (×) stays removed,
+and one gone from the disk leaves the list the next time the tab links.
+
+- **Opening** one asks the server for its file, then opens it as any design.
+- **Saving** a design that lives in the data folder (one opened from Home, or one an agent
+  opened or saved) writes it to the server's disk at once, not only after the next agent call.
+  A save made while the tab is not linked fails and says so: the design is then only in the
+  tab, unsaved.
+
+The tab remembers the server's folders between visits, so those entries stay listed while it
+links again.
+
 ## What to expect
 
 - **Keep the tab visible.** A browser pauses a hidden tab (a background tab, a minimised
@@ -160,8 +178,10 @@ The addition is contained so that merging upstream stays easy:
   `.github/workflows/fork-upstream-sync.yml` and `scripts/fork/` (the nightly sync, below),
   `.github/workflows/fork-image.yml` and `packaging/docker/smoke-test-mcp.sh` (the image), this
   page;
-- touched: `apps/solidcraft-web/src/main.rs` (a `mod` line and one call, both behind the
-  feature), `apps/solidcraft-web/Cargo.toml` (the feature), `xtask/src/layers.rs` (the new
+- touched: `apps/solidcraft-web/src/main.rs` (a `mod` line, two calls, the Home page's
+  hooks for the server's designs and a small helper, all behind the feature),
+  `apps/solidcraft-web/src/files.rs` (one arm: a save into the server's folders goes to the
+  server), `apps/solidcraft-web/Cargo.toml` (the feature), `xtask/src/layers.rs` (the new
   crate's row), `crates/ui-egui/src/control.rs` (one line: `ui.render` writes its picture
   through `vfs`, so a tab can keep it), `Cargo.lock` (the new crate; no new third-party crates).
 

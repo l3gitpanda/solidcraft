@@ -6,7 +6,8 @@
 //! to the tab, which runs it in its own engine and draws the result on that computer's GPU: an
 //! agent models while a person watches in the browser. The tools are `solidcraft-mcp`'s,
 //! unchanged; this crate adds the HTTP transport ([`mcp`]) and the tab as their backend
-//! ([`backend`], [`hub`], [`sync`]).
+//! ([`backend`], [`hub`], [`sync`]), and lists the agent's
+//! designs to the tab's Home page ([`library`]).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
@@ -14,6 +15,7 @@ pub mod backend;
 pub mod cli;
 pub mod http;
 pub mod hub;
+pub mod library;
 pub mod mcp;
 pub mod server;
 pub mod site;

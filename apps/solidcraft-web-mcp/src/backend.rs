@@ -149,6 +149,8 @@ impl TabBackend {
 
     /// Bring back what a finished request wrote, from the tab that ran it.
     fn pull(&self, synced: &mut Synced, tab: u64) -> Result<(), String> {
+        // A design the tab saved to disk itself while the call ran is no new file of the call's.
+        self.hub.absorb(synced);
         let scratch = solidcraft_mcp::scratch_dir().map(|d| d.to_string_lossy().into_owned());
         synced.pull(&mut self.link(tab, self.waits.file), &self.roots(scratch.as_deref()), scratch.as_deref())
     }
@@ -277,6 +279,7 @@ impl TabBackend {
         let syncs = touches_files(method);
         let hub = self.hub.clone();
         let mut synced = hub.turn();
+        hub.absorb(&mut synced);
         // The tab driven now is this call's tab to its end: its files go there, its request runs
         // there and its files come back from there, whatever links meanwhile.
         let Some(tab) = self.hub.active() else { return Err(no_tab(&self.url)) };

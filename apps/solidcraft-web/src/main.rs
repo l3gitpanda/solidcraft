@@ -289,6 +289,20 @@ mod web {
     use crate::keep;
     use crate::space_mouse::SpaceMouse;
 
+    /// Whether `path` is a design in the folders of the MCP server this tab is linked to
+    /// (docs/web-mcp.md): kept on Home's recent list though this browser does not hold it.
+    fn on_mcp_server(path: &str) -> bool {
+        #[cfg(feature = "mcp-link")]
+        {
+            crate::mcp_link::remembered(path)
+        }
+        #[cfg(not(feature = "mcp-link"))]
+        {
+            let _ = path;
+            false
+        }
+    }
+
     const CANVAS_ID: &str = "solidcraft_canvas";
     const LOADING_ID: &str = "solidcraft_loading";
     /// The viewport scene's depth buffer, a 32-bit float one (no stencil): WebGPU and WebGL2 both
@@ -664,6 +678,9 @@ mod web {
                 self.recents_synced = true;
                 self.sync_recents();
             }
+            // The MCP server's designs join Home's recent list; those fetched from it open.
+            #[cfg(feature = "mcp-link")]
+            crate::mcp_link::tend(&mut self.app, self.recents_synced);
             let now = ctx.input(|i| i.time);
             // With "keep unsaved work in this browser" on, each design's own copy takes over from
             // the single autosave (#10220).
@@ -935,7 +952,7 @@ mod web {
             let recent = &mut self.app.home.recent;
             let known = self.files.disk_known.borrow().clone();
             // A design on the computer's disk stays listed while its file is remembered.
-            recent.retain(|p| vfs::exists(p) || disk::parse(p).is_some_and(|(id, _)| known.contains(id)));
+            recent.retain(|p| vfs::exists(p) || disk::parse(p).is_some_and(|(id, _)| known.contains(id)) || on_mcp_server(p));
             for e in entries.iter().filter(|e| solidcraft_engine::io::is_design_path(&e.name)) {
                 let p = format!("{}{}", files::OPFS, e.name);
                 // A design the user removed from the list is not added back while it is stored.
@@ -951,7 +968,7 @@ mod web {
             // Drop forgotten entries whose stored design is gone, so the set does not grow without bound.
             let stored: std::collections::BTreeSet<String> =
                 entries.iter().filter(|e| solidcraft_engine::io::is_design_path(&e.name)).map(|e| format!("{}{}", files::OPFS, e.name)).collect();
-            self.app.home.forgotten.retain(|p| stored.contains(p));
+            self.app.home.forgotten.retain(|p| stored.contains(p) || on_mcp_server(p));
         }
 
         /// The stored designs: open, insert, rename, delete, download; open from the computer.
@@ -1553,9 +1570,16 @@ mod web {
                             // A recent design on the disk, from an earlier session, opens by asking
                             // the browser for its remembered file.
                             can_restore: Some(Box::new(move |path: &str| {
-                                disk::parse(path).is_some_and(|(id, _)| restorable.disk_known.borrow().contains(id))
+                                disk::parse(path).is_some_and(|(id, _)| restorable.disk_known.borrow().contains(id)) || on_mcp_server(path)
                             })),
-                            restore_file: Some(Box::new(move |path: &str| disk::restore(&restorer, path, None))),
+                            restore_file: Some(Box::new(move |path: &str| {
+                                // A design of the MCP server's is fetched from it.
+                                #[cfg(feature = "mcp-link")]
+                                if crate::mcp_link::restore(path) {
+                                    return;
+                                }
+                                disk::restore(&restorer, path, None)
+                            })),
                             download_design: Some(Box::new(files::download)),
                             open_bytes: Some(Box::new(files::open_in_tab)),
                             easyprint_upload: Some(std::sync::Arc::new(crate::easyprint::upload)),
