@@ -443,7 +443,11 @@ fn enqueue(files: &Rc<Files>, write: Write) {
                 disk::WriteTo::Disk => disk::write(&path, &bytes).await,
                 disk::WriteTo::Download => download(path.strip_prefix(DOWNLOADS).unwrap_or(&path), &bytes),
                 // Explicit virtual paths (for example an API fixture under /upload) use the
-                // in-memory filesystem only. The regular Save picker never returns one.
+                // in-memory filesystem only. The regular Save picker never returns one. A design
+                // in the MCP server's folders is written to its disk as well (docs/web-mcp.md).
+                #[cfg(feature = "mcp-link")]
+                disk::WriteTo::Memory => crate::mcp_link::save(&path, &bytes).await,
+                #[cfg(not(feature = "mcp-link"))]
                 disk::WriteTo::Memory => Ok(()),
             };
             if let Some((snapshot, done)) = done {

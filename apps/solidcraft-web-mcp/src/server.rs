@@ -17,6 +17,7 @@ use solidcraft_mcp::Options;
 use crate::backend::Waits;
 use crate::http::{ReadError, Request, Response, read_request, reason, write_response};
 use crate::hub::Hub;
+use crate::library;
 use crate::mcp::{Sessions, Settings};
 use crate::site::Site;
 use crate::ws::{self, Message};
@@ -299,8 +300,10 @@ impl Shared {
         let tab = self.hub.attach(writer.clone(), version, hidden);
         let send = |frame: &dyn Fn(&mut TcpStream) -> std::io::Result<()>| frame(&mut writer.lock().unwrap_or_else(PoisonError::into_inner));
         let served = (|| {
-            send(&|socket| ws::write_text(socket, &json!({"welcome": {"tab": tab}}).to_string()))?;
+            // With the agent's designs, for the tab's Home page (`library`).
+            send(&|socket| ws::write_text(socket, &library::welcome(tab, &self.config.folders).to_string()))?;
             input.get_ref().set_read_timeout(Some(TAB_SILENCE))?;
+            let uploads = library::Uploads::default();
             loop {
                 match ws::read_message(&mut input, &mut partial, MAX_TAB_MESSAGE)? {
                     Message::Text(text) => {
@@ -309,6 +312,17 @@ impl Shared {
                             self.hub.deliver(tab, id, message);
                         } else if let Some(hidden) = message.get("hidden").and_then(Value::as_bool) {
                             self.hub.set_hidden(tab, hidden);
+                        } else if let Some(path) = message.get("fetch").and_then(|f| f.get("path")).and_then(Value::as_str) {
+                            // A design opened from Home: sent from a thread of its own, so the
+                            // link goes on reading the tab's answers meanwhile.
+                            let (hub, writer, scope, path) = (self.hub.clone(), writer.clone(), self.config.scope.clone(), path.to_string());
+                            let _ = std::thread::Builder::new()
+                                .name("tab-fetch".into())
+                                .spawn(move || library::fetch(&hub, tab, &writer, scope.as_ref(), &path));
+                        } else if let Some(put) = message.get("put")
+                            && let Some(answer) = uploads.put(&self.hub, tab, self.config.scope.as_ref(), put)
+                        {
+                            send(&|socket| ws::write_text(socket, &answer.to_string()))?;
                         }
                     }
                     Message::Ping(payload) => send(&|socket| ws::write_pong(socket, &payload))?,

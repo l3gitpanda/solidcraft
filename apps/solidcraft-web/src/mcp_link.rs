@@ -5,6 +5,10 @@
 //! copies files in and out of the engine's in-memory files (`vfs`) around a request: a design to
 //! open comes in, a screenshot or an export goes back.
 //!
+//! The server's welcome also lists the designs in its folders, which the Home page shows under
+//! Recent designs ([`merge`]): opening one asks the server for its file, and saving a design that
+//! lives there writes it back to the server's disk (docs/web-mcp.md, "Recent designs").
+//!
 //! Built only with the `mcp-link` feature. A page served by anything else has no `mcp-link`
 //! beside it: the socket fails, and the tab tries again now and then without a word.
 //!
@@ -17,8 +21,19 @@ use serde_json::{Value, json};
 #[cfg(target_arch = "wasm32")]
 const TOKEN_KEY: &str = "solidcraft.mcp_link.token";
 
+/// The local-storage name the server's folders are kept under, so its designs stay on the Home
+/// page between visits, before the link is back (per release channel).
+#[cfg(target_arch = "wasm32")]
+const FOLDERS_KEY: &str = "solidcraft.mcp_link.folders";
+
 /// The most bytes of a file read into one reply, whatever the server asks for.
 const MAX_CHUNK: usize = 8 << 20;
+/// The bytes of a design sent to the server in one message.
+#[cfg(target_arch = "wasm32")]
+const UPLOAD_CHUNK: usize = 4 << 20;
+/// The most folders and designs taken from a welcome.
+const MAX_FOLDERS: usize = 64;
+const MAX_DESIGNS: usize = 200;
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -74,6 +89,89 @@ pub fn link_url(protocol: &str, host: &str, pathname: &str) -> String {
 /// The token in the page address's fragment (`#mcp-token=…`, alone or among `&`-joined parts).
 pub fn token_in_fragment(fragment: &str) -> Option<String> {
     fragment.trim_start_matches('#').split('&').find_map(|part| part.strip_prefix("mcp-token=")).filter(|t| !t.is_empty()).map(str::to_string)
+}
+
+/// Whether `path` lies inside folder `root`, a path of the server's own (`/data`, `C:\\data`):
+/// either separator ends the folder's name, as the file messages take it.
+pub fn under(root: &str, path: &str) -> bool {
+    let root = root.trim_end_matches(['/', '\\']);
+    !root.is_empty() && path.starts_with(root) && path.get(root.len()..).is_some_and(|rest| rest.starts_with(['/', '\\']))
+}
+
+/// What a welcome says of the server's designs: the agent's folders, and the designs in them
+/// (path, last changed in seconds since 1970), newest first.
+#[derive(Debug, Default, PartialEq)]
+pub struct Library {
+    pub folders: Vec<String>,
+    pub designs: Vec<(String, u64)>,
+    /// Whether the list names every design the server has: a server with more lists only its
+    /// newest, and a design it leaves out may still be there.
+    pub complete: bool,
+}
+
+impl Library {
+    pub fn from_welcome(welcome: &Value) -> Library {
+        let list = |key: &str| welcome.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
+        let folders = list("folders").iter().filter_map(Value::as_str).filter(|f| !f.is_empty()).take(MAX_FOLDERS).map(str::to_string).collect();
+        let designs = list("designs")
+            .iter()
+            .filter_map(|d| Some((d.get("path")?.as_str()?.to_string(), d.get("modified").and_then(Value::as_u64).unwrap_or(0))))
+            .take(MAX_DESIGNS)
+            .collect();
+        let complete = welcome.get("complete").and_then(Value::as_bool).unwrap_or(false);
+        Library { folders, designs, complete }
+    }
+
+    /// Whether `path` is in one of the server's folders.
+    pub fn holds(&self, path: &str) -> bool {
+        self.folders.iter().any(|f| under(f, path))
+    }
+}
+
+/// Put the server's designs on the Home page's recent list. A design of the server's folders the
+/// server no longer has goes (only when its list is complete: one left out of a list cut short
+/// may still be there); one it has and the list lacks joins at the end, unless the person
+/// removed it from the list (`forgotten`) or the list is full; one already listed keeps its place.
+/// A design that joins shows when it last changed until it is opened here.
+pub fn merge(
+    recent: &mut Vec<String>,
+    forgotten: &mut std::collections::BTreeSet<String>,
+    opened_at: &mut std::collections::BTreeMap<String, u64>,
+    library: &Library,
+    max: usize,
+) {
+    let listed = |p: &String| !library.complete || library.designs.iter().any(|(d, _)| d == p);
+    recent.retain(|p| !library.holds(p) || listed(p));
+    for (path, modified) in &library.designs {
+        if recent.len() < max && library.holds(path) && !recent.contains(path) && !forgotten.contains(path) {
+            recent.push(path.clone());
+            opened_at.entry(path.clone()).or_insert(*modified);
+        }
+    }
+    // A removal is kept while the server has the design, and no longer.
+    forgotten.retain(|p| !library.holds(p) || listed(p));
+}
+
+/// The largest design taken from the server, as the server caps it.
+const MAX_FETCHED: usize = 512 << 20;
+
+/// Take one piece of a design the server is sending (`{path, data, append}`) into `arriving`,
+/// kept apart from the engine's files until the whole design has come: a file half there must
+/// never be seen, and copied back to the server, by an agent's call running meanwhile.
+pub fn take_piece(arriving: &mut std::collections::HashMap<String, Vec<u8>>, piece: &Value) -> Result<(), String> {
+    let path = piece.get("path").and_then(Value::as_str).ok_or("missing `path`")?;
+    let mut bytes = decode(piece.get("data").and_then(Value::as_str).unwrap_or_default()).ok_or("`data` is not base64")?;
+    if piece.get("append").and_then(Value::as_bool) == Some(true) {
+        let held = arriving.get_mut(path).ok_or("a piece came without the start of its design")?;
+        if held.len() + bytes.len() > MAX_FETCHED {
+            arriving.remove(path);
+            return Err("larger than 512 MiB".into());
+        }
+        held.append(&mut bytes);
+    } else {
+        arriving.insert(path.to_string(), bytes);
+    }
+    Ok(())
 }
 
 /// The engine's in-memory files, as the file messages use them.
@@ -155,8 +253,20 @@ pub enum Incoming {
         id: u64,
         message: Value,
     },
-    /// The server took the hello: the tab is linked.
-    Welcome,
+    /// The server took the hello: the tab is linked. It lists the server's designs.
+    Welcome(Value),
+    /// A piece of a design the person opened from Home: `{path, data, append}`.
+    Piece(Value),
+    /// The whole design asked for has come, or why it cannot.
+    Fetched {
+        path: String,
+        error: Option<String>,
+    },
+    /// The server wrote a design this tab saved, or says why not.
+    Saved {
+        number: u64,
+        error: Option<String>,
+    },
     /// The server refused the hello's token.
     Refused,
     Other,
@@ -170,7 +280,22 @@ pub fn incoming(text: &str) -> Incoming {
             Incoming::Control { id, method: method.to_string(), params: message.get("params").cloned().unwrap_or_else(|| json!({})) }
         }
         (Some(id), None) if message.get("fs").is_some() => Incoming::File { id, message },
-        _ if message.get("welcome").is_some() => Incoming::Welcome,
+        (None, None) if message.get("welcome").is_some_and(Value::is_object) => Incoming::Welcome(message["welcome"].clone()),
+        (None, None) if message.get("file").is_some_and(Value::is_object) => Incoming::Piece(message["file"].clone()),
+        (None, None) if message.get("fetched").is_some() => {
+            let fetched = &message["fetched"];
+            match fetched.get("path").and_then(Value::as_str) {
+                Some(path) => Incoming::Fetched { path: path.to_string(), error: fetched.get("error").and_then(Value::as_str).map(str::to_string) },
+                None => Incoming::Other,
+            }
+        }
+        (None, None) if message.get("saved").is_some() => {
+            let saved = &message["saved"];
+            match saved.get("ref").and_then(Value::as_u64) {
+                Some(number) => Incoming::Saved { number, error: saved.get("error").and_then(Value::as_str).map(str::to_string) },
+                None => Incoming::Other,
+            }
+        }
         _ if message.get("refused").is_some() => Incoming::Refused,
         _ => Incoming::Other,
     }
@@ -185,7 +310,7 @@ pub fn with_id(mut reply: Value, id: u64) -> String {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use web::start;
+pub use web::{remembered, restore, save, start, tend};
 
 #[cfg(target_arch = "wasm32")]
 mod web {
@@ -199,7 +324,10 @@ mod web {
     use solidcraft_engine::io::vfs;
     use wasm_bindgen::{JsCast as _, JsValue, closure::Closure};
 
-    use super::{Incoming, Store, TOKEN_KEY, file_reply, incoming, link_url, token_in_fragment, with_id};
+    use super::{
+        FOLDERS_KEY, Incoming, Library, Store, TOKEN_KEY, UPLOAD_CHUNK, encode, file_reply, incoming, link_url, merge, take_piece, token_in_fragment,
+        under, with_id,
+    };
 
     /// The engine's in-memory files.
     struct Files;
@@ -241,6 +369,108 @@ mod web {
         on_close: RefCell<Option<Function>>,
         on_retry: RefCell<Option<Function>>,
         on_poll: RefCell<Option<Function>>,
+        /// The server took this tab's hello and the socket is still open.
+        linked: Cell<bool>,
+        /// The server's folders, as its last welcome named them (kept between visits).
+        folders: RefCell<Vec<String>>,
+        /// The server's designs from its welcome, for the Home page to take ([`tend`]).
+        library: RefCell<Option<Library>>,
+        /// Designs fetched from the server, to open.
+        opened: RefCell<Vec<String>>,
+        /// Messages for the status line: text, whether it is an error.
+        messages: RefCell<Vec<(String, bool)>>,
+        /// Saves sent to the server and not answered yet: their number, and the promise's resolve.
+        saves: RefCell<std::collections::HashMap<u64, Function>>,
+        last_save: Cell<u64>,
+        /// Designs on their way from the server, by path: kept out of the engine's files until
+        /// whole ([`take_piece`]).
+        arriving: RefCell<std::collections::HashMap<String, Vec<u8>>>,
+    }
+
+    /// How long a save waits for the server to say it wrote the design.
+    const SAVE_WAIT_MS: i32 = 5 * 60 * 1000;
+
+    thread_local! {
+        /// The page's one link, for the app's hooks below.
+        static LINK: RefCell<Option<Rc<Link>>> = const { RefCell::new(None) };
+    }
+
+    fn the_link() -> Option<Rc<Link>> {
+        LINK.with(|l| l.borrow().clone())
+    }
+
+    /// Whether `path` is a design in the server's folders: kept on the Home page's recent list
+    /// while the server is away, opened by asking the server ([`restore`]).
+    pub fn remembered(path: &str) -> bool {
+        the_link().is_some_and(|link| link.owns(path))
+    }
+
+    /// Open a design of the server's from the Home page: ask the server for its file; it opens
+    /// once it has come. False: not one of the server's.
+    pub fn restore(path: &str) -> bool {
+        let Some(link) = the_link().filter(|link| link.owns(path)) else { return false };
+        if link.linked.get() {
+            link.send(&json!({"fetch": {"path": path}}).to_string());
+        } else {
+            link.say(solidcraft_ui_text::tr("web.mcp.open_unlinked").replace("{path}", path), true);
+        }
+        true
+    }
+
+    /// Write a design saved in this tab to the server's disk, when it lives in the server's
+    /// folders; anything else is not the server's and is left alone. Done when the server has
+    /// written it, so a save that did not reach the disk says so.
+    pub async fn save(path: &str, bytes: &[u8]) -> Result<(), String> {
+        let Some(link) = the_link().filter(|link| link.owns(path)) else { return Ok(()) };
+        if !link.linked.get() {
+            return Err(solidcraft_ui_text::tr("web.mcp.save_unlinked").to_string());
+        }
+        let number = link.last_save.get() + 1;
+        link.last_save.set(number);
+        let mut resolve = None;
+        let answered = js_sys::Promise::new(&mut |done, _| resolve = Some(done));
+        if let Some(done) = resolve {
+            link.saves.borrow_mut().insert(number, done);
+        }
+        let pieces: Vec<&[u8]> = if bytes.is_empty() { vec![&[]] } else { bytes.chunks(UPLOAD_CHUNK).collect() };
+        let count = pieces.len();
+        for (i, piece) in pieces.into_iter().enumerate() {
+            let put = json!({"put": {"ref": number, "path": path, "data": encode(piece), "append": i > 0, "last": i + 1 == count}});
+            link.send(&put.to_string());
+        }
+        // Saves are written one after another: one the server never answers must not hold up
+        // the rest for ever.
+        let late = JsValue::from_str(solidcraft_ui_text::tr("web.mcp.save_unanswered"));
+        let timer = js_sys::Promise::new(&mut |done, _| {
+            if let Some(window) = web_sys::window() {
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_1(&done, SAVE_WAIT_MS, &late);
+            }
+        });
+        let answer = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::race(&Array::of2(&answered, &timer))).await;
+        link.saves.borrow_mut().remove(&number);
+        match answer {
+            Ok(answer) => answer.as_string().map_or(Ok(()), Err),
+            Err(_) => Err(solidcraft_ui_text::tr("web.mcp.save_lost").to_string()),
+        }
+    }
+
+    /// Each frame: open the designs fetched from the server, show the link's messages, and once
+    /// the Home page's recent list is built from the browser's own designs (`recents_ready`),
+    /// add the server's to it.
+    pub fn tend(app: &mut solidcraft_ui_egui::SolveApp, recents_ready: bool) {
+        let Some(link) = the_link() else { return };
+        let opened: Vec<String> = link.opened.borrow_mut().drain(..).collect();
+        for path in opened {
+            app.open_path_async(&path);
+        }
+        let messages: Vec<(String, bool)> = link.messages.borrow_mut().drain(..).collect();
+        for (text, error) in messages {
+            app.set_status(text, error);
+        }
+        if recents_ready && let Some(library) = link.library.borrow_mut().take() {
+            let home = &mut app.home;
+            merge(&mut home.recent, &mut home.forgotten, &mut home.opened_at, &library, solidcraft_ui_egui::home::MAX_RECENT);
+        }
     }
 
     fn hidden() -> bool {
@@ -254,6 +484,24 @@ mod web {
     }
 
     impl Link {
+        fn owns(&self, path: &str) -> bool {
+            solidcraft_engine::io::is_design_path(path) && self.folders.borrow().iter().any(|f| under(f, path))
+        }
+
+        fn say(&self, text: String, error: bool) {
+            self.messages.borrow_mut().push((text, error));
+            self.ctx.request_repaint();
+        }
+
+        /// Answer save `number` (`None`: written) and forget it.
+        fn answer_save(&self, number: u64, error: Option<String>) {
+            let done = self.saves.borrow_mut().remove(&number);
+            if let Some(done) = done {
+                let answer = error.map_or(JsValue::NULL, |e| JsValue::from_str(&e));
+                let _ = done.call1(&JsValue::NULL, &answer);
+            }
+        }
+
         fn send(&self, text: &str) {
             if let Some(socket) = self.socket.borrow().as_ref()
                 && let Ok(send) = Reflect::get(socket, &"send".into()).and_then(|f| f.dyn_into::<Function>())
@@ -286,6 +534,13 @@ mod web {
 
         fn closed(&self) {
             *self.socket.borrow_mut() = None;
+            self.linked.set(false);
+            self.arriving.borrow_mut().clear();
+            // Saves the server had not answered may not have reached its disk.
+            let unanswered: Vec<u64> = self.saves.borrow().keys().copied().collect();
+            for number in unanswered {
+                self.answer_save(number, Some(solidcraft_ui_text::tr("web.mcp.save_link_broke").to_string()));
+            }
             // The requests the server was waiting for are lost to it; their replies go nowhere.
             self.pending.borrow_mut().clear();
             if self.refused.get() {
@@ -311,10 +566,39 @@ mod web {
                     }
                 }
                 Incoming::File { id, message } => self.send(&with_id(file_reply(&mut Files, &message), id)),
-                Incoming::Welcome => {
+                Incoming::Welcome(welcome) => {
                     self.retry_ms.set(1000);
+                    self.linked.set(true);
                     log::info!("MCP link: this tab is linked to {}", self.url);
+                    let library = Library::from_welcome(&welcome);
+                    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+                        let _ = storage.set_item(&crate::channel::key(FOLDERS_KEY), &json!(library.folders).to_string());
+                    }
+                    *self.folders.borrow_mut() = library.folders.clone();
+                    *self.library.borrow_mut() = Some(library);
+                    self.ctx.request_repaint();
                 }
+                Incoming::Piece(piece) => {
+                    if let Err(e) = take_piece(&mut self.arriving.borrow_mut(), &piece) {
+                        log::warn!("MCP link: a design from the server could not be kept: {e}");
+                    }
+                }
+                Incoming::Fetched { path, error } => {
+                    // Whole now: only here does it join the engine's files, to be opened.
+                    let arrived = self.arriving.borrow_mut().remove(&path);
+                    match (arrived, error) {
+                        (Some(bytes), None) => {
+                            vfs::insert(&path, bytes);
+                            self.opened.borrow_mut().push(path);
+                            self.ctx.request_repaint();
+                        }
+                        (_, error) => {
+                            let why = error.unwrap_or_else(|| solidcraft_ui_text::tr("web.mcp.not_whole").to_string());
+                            self.say(solidcraft_ui_text::tr("web.mcp.open_failed").replace("{path}", &path).replace("{error}", &why), true);
+                        }
+                    }
+                }
+                Incoming::Saved { number, error } => self.answer_save(number, error),
                 Incoming::Refused => {
                     self.refused.set(true);
                     log::warn!(
@@ -372,6 +656,12 @@ mod web {
             }
             let _ = location.set_hash("");
         }
+        // The server's folders from an earlier visit: its designs stay on Home until it says more.
+        let folders = storage
+            .as_ref()
+            .and_then(|s| s.get_item(&crate::channel::key(FOLDERS_KEY)).ok().flatten())
+            .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
+            .unwrap_or_default();
         let token = fresh.or_else(|| storage.and_then(|s| s.get_item(&key).ok().flatten()));
         let link = Rc::new(Link {
             sender,
@@ -388,7 +678,16 @@ mod web {
             on_close: RefCell::default(),
             on_retry: RefCell::default(),
             on_poll: RefCell::default(),
+            linked: Cell::new(false),
+            folders: RefCell::new(folders),
+            library: RefCell::default(),
+            opened: RefCell::default(),
+            messages: RefCell::default(),
+            saves: RefCell::default(),
+            last_save: Cell::new(0),
+            arriving: RefCell::default(),
         });
+        LINK.with(|l| *l.borrow_mut() = Some(link.clone()));
         // The handlers keep the link for the life of the page.
         let l = link.clone();
         *link.on_open.borrow_mut() = handler(move |_| l.opened());
@@ -485,9 +784,30 @@ mod tests {
         );
         assert_eq!(incoming(r#"{"id":4,"method":"ui.inspect"}"#), Incoming::Control { id: 4, method: "ui.inspect".into(), params: json!({}) });
         assert!(matches!(incoming(r#"{"id":5,"fs":"list","roots":[]}"#), Incoming::File { id: 5, .. }));
-        assert_eq!(incoming(r#"{"welcome":{"tab":1}}"#), Incoming::Welcome);
+        assert_eq!(incoming(r#"{"welcome":{"tab":1}}"#), Incoming::Welcome(json!({"tab": 1})));
+        assert_eq!(
+            incoming(r#"{"file":{"path":"/data/a.sc","data":"","append":false}}"#),
+            Incoming::Piece(json!({"path": "/data/a.sc", "data": "", "append": false}))
+        );
+        assert_eq!(incoming(r#"{"fetched":{"path":"/data/a.sc"}}"#), Incoming::Fetched { path: "/data/a.sc".into(), error: None });
+        assert_eq!(
+            incoming(r#"{"fetched":{"path":"/data/a.sc","error":"gone"}}"#),
+            Incoming::Fetched { path: "/data/a.sc".into(), error: Some("gone".into()) }
+        );
+        assert_eq!(incoming(r#"{"saved":{"ref":2}}"#), Incoming::Saved { number: 2, error: None });
+        assert_eq!(incoming(r#"{"saved":{"ref":3,"error":"full"}}"#), Incoming::Saved { number: 3, error: Some("full".into()) });
         assert_eq!(incoming(r#"{"refused":"token"}"#), Incoming::Refused);
-        for other in ["", "not json", "[]", r#"{"method":"no.id"}"#, r#"{"id":"text","method":"x"}"#, r#"{"id":1}"#] {
+        for other in [
+            "",
+            "not json",
+            "[]",
+            r#"{"method":"no.id"}"#,
+            r#"{"id":"text","method":"x"}"#,
+            r#"{"id":1}"#,
+            r#"{"welcome":true}"#,
+            r#"{"fetched":{}}"#,
+            r#"{"saved":{"ref":"x"}}"#,
+        ] {
             assert_eq!(incoming(other), Incoming::Other, "{other}");
         }
         assert_eq!(with_id(json!({"ok": true, "result": 1}), 9), r#"{"id":9,"ok":true,"result":1}"#);
@@ -526,5 +846,80 @@ mod tests {
             let reply = call(&mut store, bad.clone());
             assert!(reply["ok"] == false && reply["error"].as_str().unwrap().contains(why), "{bad}: {reply}");
         }
+    }
+
+    #[test]
+    fn a_folder_holds_only_what_lies_beyond_its_name() {
+        assert!(under("/data", "/data/a.sc"));
+        assert!(under("/data/", "/data/sub/a.sc"));
+        assert!(under(r"C:\data", r"C:\data\a.sc"));
+        assert!(!under("/data", "/database/a.sc"));
+        assert!(!under("/data", "/data"));
+        assert!(!under("", "/a.sc"));
+        assert!(!under("/", "/a.sc"), "an empty folder name holds nothing");
+    }
+
+    #[test]
+    fn the_welcome_lists_the_servers_designs_for_home() {
+        let library = Library::from_welcome(&json!({
+            "tab": 1,
+            "folders": ["/data", 7, ""],
+            "designs": [{"path": "/data/new.sc", "modified": 30}, {"path": "/data/old.sc", "modified": 10}, {"modified": 5}, "x"],
+        }));
+        assert_eq!(library.folders, ["/data"]);
+        assert_eq!(library.designs, [("/data/new.sc".to_string(), 30), ("/data/old.sc".to_string(), 10)]);
+        assert!(!library.complete, "a welcome that does not say so may have been cut short");
+        assert!(Library::from_welcome(&json!({"complete": true})).complete);
+        assert_eq!(Library::from_welcome(&json!({"tab": 1})), Library::default(), "an older server lists nothing");
+    }
+
+    #[test]
+    fn the_servers_designs_join_the_recent_list_and_leave_it_when_gone() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let library = Library {
+            folders: vec!["/data".into()],
+            designs: vec![("/data/new.sc".into(), 30), ("/data/kept.sc".into(), 20), ("/data/removed.sc".into(), 10), ("/elsewhere.sc".into(), 5)],
+            complete: true,
+        };
+        // The browser's own designs and a remembered one of the server's keep their places; one
+        // the server no longer has goes; the person's removal stands.
+        let mut recent: Vec<String> = ["/opfs/mine.sc", "/data/kept.sc", "/data/deleted.sc"].map(String::from).to_vec();
+        let mut forgotten: BTreeSet<String> = ["/data/removed.sc", "/data/deleted.sc", "/opfs/old.sc"].map(String::from).into();
+        let mut opened_at = BTreeMap::from([("/data/kept.sc".to_string(), 99)]);
+        merge(&mut recent, &mut forgotten, &mut opened_at, &library, 12);
+        assert_eq!(recent, ["/opfs/mine.sc", "/data/kept.sc", "/data/new.sc"]);
+        assert_eq!(forgotten, ["/data/removed.sc", "/opfs/old.sc"].map(String::from).into(), "a removal lasts while the server has the design");
+        assert_eq!(opened_at, BTreeMap::from([("/data/kept.sc".to_string(), 99), ("/data/new.sc".to_string(), 30)]));
+        // A list cut short drops nothing it leaves out, and keeps removals of what it leaves out.
+        let short = Library { complete: false, ..library };
+        let mut recent = vec!["/data/older.sc".to_string()];
+        let mut forgotten: BTreeSet<String> = ["/data/oldest.sc".to_string()].into();
+        merge(&mut recent, &mut forgotten, &mut BTreeMap::new(), &short, 12);
+        assert_eq!(recent, ["/data/older.sc", "/data/new.sc", "/data/kept.sc", "/data/removed.sc"]);
+        assert!(forgotten.contains("/data/oldest.sc"));
+        let library = short;
+        // A full list takes no more.
+        let mut full: Vec<String> = (0..12).map(|i| format!("/opfs/{i}.sc")).collect();
+        merge(&mut full, &mut BTreeSet::new(), &mut BTreeMap::new(), &library, 12);
+        assert!(full.iter().all(|p| p.starts_with("/opfs/")));
+    }
+
+    #[test]
+    fn a_design_from_the_server_is_held_apart_until_whole() {
+        let mut arriving = std::collections::HashMap::new();
+        take_piece(&mut arriving, &json!({"path": "/data/a.sc", "data": encode(b"hel"), "append": false})).unwrap();
+        take_piece(&mut arriving, &json!({"path": "/data/a.sc", "data": encode(b"lo"), "append": true})).unwrap();
+        assert_eq!(arriving["/data/a.sc"], b"hello");
+        // Begun again, it starts afresh.
+        take_piece(&mut arriving, &json!({"path": "/data/a.sc", "data": encode(b"new"), "append": false})).unwrap();
+        assert_eq!(arriving["/data/a.sc"], b"new");
+        for (bad, why) in [
+            (json!({"path": "/data/b.sc", "data": encode(b"x"), "append": true}), "without the start"),
+            (json!({"path": "/data/b.sc", "data": "!", "append": false}), "base64"),
+            (json!({"data": encode(b"x")}), "path"),
+        ] {
+            assert!(take_piece(&mut arriving, &bad).unwrap_err().contains(why), "{bad}");
+        }
+        assert!(!arriving.contains_key("/data/b.sc"));
     }
 }

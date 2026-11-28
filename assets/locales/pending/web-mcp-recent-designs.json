@@ -1,0 +1,11 @@
+{
+  "en": {
+    "web.mcp.not_whole": "it did not arrive whole",
+    "web.mcp.open_failed": "{path} could not be opened from SolidCraft's server: {error}",
+    "web.mcp.open_unlinked": "{path} is on SolidCraft's server, which this tab is not linked to now: try again in a moment",
+    "web.mcp.save_link_broke": "may not be saved on SolidCraft's server: the link to it broke before it answered",
+    "web.mcp.save_lost": "not saved on SolidCraft's server: its answer was lost",
+    "web.mcp.save_unanswered": "may not be saved on SolidCraft's server: it did not answer within five minutes",
+    "web.mcp.save_unlinked": "not saved on SolidCraft's server: this tab is not linked to it now, so the design is only in this tab"
+  }
+}

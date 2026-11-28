@@ -106,7 +106,7 @@ fn fetch(tab: &mut dyn Tab, path: &str, size: u64) -> Result<Vec<u8>, String> {
 /// Put `bytes` at `path` on this side, making its folder if need be. Whole or not at all: a copy
 /// cut short (a full disk, the server stopped) leaves the file that was there, a saved design
 /// above all, as it was.
-fn publish(path: &str, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn publish(path: &str, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = Path::new(path).parent().and_then(Path::to_str).filter(|p| !p.is_empty()) {
         vfs::create_new_dir_all(parent).map_err(|e| format!("{parent}: {e}"))?;
     }
@@ -121,6 +121,15 @@ impl Synced {
             self.tabs.remove(&oldest);
         }
         self.tabs.entry(tab).or_default()
+    }
+
+    /// Tab `tab` holds `path` as it is here, by a copy made outside any call (a design the
+    /// person opened from Home or saved in the tab, see `library`): `here` is the file's stamp
+    /// then. Neither side sends it again until it changes.
+    pub fn note(&mut self, tab: u64, path: String, here: Option<(SystemTime, u64)>, digest: String) {
+        let record = self.record(tab);
+        record.failed.remove(&path);
+        record.files.insert(path, Entry { here, digest });
     }
 
     /// Before a call: send the tab each file `params` names that exists here and that the tab

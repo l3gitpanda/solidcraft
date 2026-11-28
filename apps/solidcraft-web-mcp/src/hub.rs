@@ -88,7 +88,12 @@ pub struct Hub {
     /// Held across one call's file copies and its request, so two agents' copies do not mix;
     /// it holds what has been copied so far.
     turn: Mutex<Synced>,
+    /// Copies made between a tab and here outside any call (`library`), for the next call's
+    /// record: tab, path, the file's stamp here, its digest.
+    noted: Mutex<Vec<Noted>>,
 }
+
+type Noted = (u64, String, Option<(std::time::SystemTime, u64)>, String);
 
 impl Hub {
     fn state(&self) -> MutexGuard<'_, State> {
@@ -98,6 +103,24 @@ impl Hub {
     /// One caller at a time copies files and sends its request.
     pub fn turn(&self) -> MutexGuard<'_, Synced> {
         self.turn.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Tab `tab` holds `path` as it is here (see [`Synced::note`]).
+    pub fn note(&self, tab: u64, path: &str, here: Option<(std::time::SystemTime, u64)>, digest: String) {
+        let mut noted = self.noted.lock().unwrap_or_else(PoisonError::into_inner);
+        // Bounded: with no call to take them, only the latest few hundred matter.
+        if noted.len() >= 1024 {
+            noted.remove(0);
+        }
+        noted.push((tab, path.to_string(), here, digest));
+    }
+
+    /// Put the copies noted since into a call's record.
+    pub fn absorb(&self, synced: &mut Synced) {
+        let noted = std::mem::take(&mut *self.noted.lock().unwrap_or_else(PoisonError::into_inner));
+        for (tab, path, here, digest) in noted {
+            synced.note(tab, path, here, digest);
+        }
     }
 
     /// A tab linked: it is the one driven from now on.
