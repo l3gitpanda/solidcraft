@@ -37,13 +37,16 @@ From the repository root:
 
 ```sh
 export SOLIDCRAFT_WEB_MCP_TOKEN="$(openssl rand -hex 32)"
-docker compose -f packaging/docker/compose.mcp.yaml up -d --build
+docker compose -f packaging/docker/compose.mcp.yaml up -d
 ```
 
-The first build compiles the web app and the server, which takes a while (an hour or more on
+That pulls `ghcr.io/l3gitpanda/solidcraft-web-mcp:latest`, which the fork's GitHub Actions
+build from its `main` (see [The image](#the-image)), so the server needs no build tools or
+spare memory. To build the image yourself instead, set `SOLIDCRAFT_IMAGE=solidcraft-web-mcp:local`
+and `SOLIDCRAFT_PULL_POLICY=build` (in the environment or a `.env` file beside the compose
+file). The build compiles the web app and the server, which takes a while (an hour or more on
 four cores) and a lot of memory: packaging the web app (Trunk's `wasm-bindgen` step) needs about
-20 GB of RAM and swap together, and is killed part-way with less. On a smaller server, build the
-image on a bigger computer and move it over with `docker save` and `docker load`. Then:
+20 GB of RAM and swap together, and is killed part-way with less. Then:
 
 1. Open `http://localhost:8080/#mcp-token=<the token>` once. The tab keeps the token in the
    browser's storage and takes it out of the address; later visits to `http://localhost:8080/`
@@ -154,7 +157,8 @@ The addition is contained so that merging upstream stays easy:
 
 - new: `apps/solidcraft-web-mcp/` (the server), `apps/solidcraft-web/src/mcp_link.rs` (the tab's
   side), `packaging/docker/Dockerfile.mcp` and its `.dockerignore`, `packaging/docker/compose.mcp.yaml`,
-  `.github/workflows/fork-upstream-sync.yml` and `scripts/fork/` (the nightly sync, below), this
+  `.github/workflows/fork-upstream-sync.yml` and `scripts/fork/` (the nightly sync, below),
+  `.github/workflows/fork-image.yml` and `packaging/docker/smoke-test-mcp.sh` (the image), this
   page;
 - touched: `apps/solidcraft-web/src/main.rs` (a `mod` line and one call, both behind the
   feature), `apps/solidcraft-web/Cargo.toml` (the feature), `xtask/src/layers.rs` (the new
@@ -194,5 +198,25 @@ settings, Fine-grained tokens) for this repository only, with **Contents**, **Wo
 `SYNC_TOKEN` (the repository's Settings, Secrets and variables, Actions). Without it the run
 stops at once and says so. When the token expires, the run fails the same way: make a new one.
 
-The sync updates the source only. The Docker image is not rebuilt by it: rebuild with
-`docker compose -f packaging/docker/compose.mcp.yaml up -d --build` after pulling.
+Its push to `main` starts the image build below, so a clean sync ends with a new image.
+
+### The image
+
+`.github/workflows/fork-image.yml` builds `packaging/docker/Dockerfile.mcp` from the fork's
+`main` on every push to it (each nightly sync, and any merge), runs
+`packaging/docker/smoke-test-mcp.sh` against it (the app is served with its MCP link compiled
+in, MCP answers `initialize` with the token and refuses without it), and publishes it as
+`ghcr.io/l3gitpanda/solidcraft-web-mcp`, tagged `latest` and `sha-<commit>`. GitHub's runner
+has 16 GB of memory, so the job adds 24 GB of swap for the `wasm-bindgen` step; each run's
+summary gives the peak it reached. A pull request that changes the recipe gets the same build
+and test, unpublished. Pin a `sha-` tag in `SOLIDCRAFT_IMAGE` to stay on one build.
+
+The package is private when first published. Either make it public (the package's page on
+GitHub, Package settings, Change visibility), or log the host in once with a token that may
+read packages: `docker login ghcr.io -u l3gitpanda`.
+
+To move the server to a newer image: `docker compose -f packaging/docker/compose.mcp.yaml pull`
+and `up -d`. To have that happen on its own, run Watchtower (or one of its maintained forks;
+the original is no longer maintained) on the host: the compose file labels the service
+`com.centurylinklabs.watchtower.enable=true`, so a Watchtower started with `--label-enable`
+updates this container and nothing else.

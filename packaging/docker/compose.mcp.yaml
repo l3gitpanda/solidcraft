@@ -2,7 +2,15 @@
 # From this folder, or from anywhere with -f packaging/docker/compose.mcp.yaml:
 #
 #   export SOLIDCRAFT_WEB_MCP_TOKEN="$(openssl rand -hex 32)"     (or put it in a .env file here)
-#   docker compose -f compose.mcp.yaml up -d --build
+#   docker compose -f compose.mcp.yaml up -d
+#
+# That runs the image the fork's GitHub Actions build from its main after every upstream sync
+# (.github/workflows/fork-image.yml): ghcr.io/l3gitpanda/solidcraft-web-mcp:latest, pulled on
+# each `up`. `docker compose -f compose.mcp.yaml pull && docker compose -f compose.mcp.yaml up -d`
+# moves to a newer one; so does Watchtower, if it runs on the host (the label below).
+# To build the image here instead (about 20 GB of memory; docs/web-mcp.md):
+#
+#   SOLIDCRAFT_IMAGE=solidcraft-web-mcp:local SOLIDCRAFT_PULL_POLICY=build docker compose -f compose.mcp.yaml up -d
 #
 # Then open http://localhost:8080/#mcp-token=<the token> once in your browser, and point an MCP
 # client at http://localhost:8080/mcp with the header `Authorization: Bearer <the token>`.
@@ -14,7 +22,8 @@
 name: solidcraft-mcp
 services:
   solidcraft:
-    image: solidcraft-web-mcp:local
+    image: "${SOLIDCRAFT_IMAGE:-ghcr.io/l3gitpanda/solidcraft-web-mcp:latest}"
+    pull_policy: "${SOLIDCRAFT_PULL_POLICY:-always}"
     build:
       context: ../..
       dockerfile: packaging/docker/Dockerfile.mcp
@@ -28,6 +37,9 @@ services:
       # Designs, exports and pictures the agents save: paths under /data in their tool calls.
       - data:/data
     restart: unless-stopped
+    labels:
+      # Lets a Watchtower on this host (one started with --label-enable, or any) update it.
+      com.centurylinklabs.watchtower.enable: "true"
     read_only: true
     tmpfs:
       - /tmp

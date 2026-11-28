@@ -1,0 +1,120 @@
+# The fork's own workflow (l3gitpanda/solidcraft), not upstream's: builds the web MCP image
+# (packaging/docker/Dockerfile.mcp, docs/web-mcp.md) from the fork's main and publishes it as
+# ghcr.io/<owner>/solidcraft-web-mcp, tagged `latest` and `sha-<commit>`. It runs on every push
+# to main, which includes each night's upstream sync (fork-upstream-sync.yml pushes with a
+# personal token, so its push starts this). A pull request that changes the image's recipe gets
+# the same build and smoke test without publishing.
+#
+# Packaging the web app (wasm-bindgen) needs about 20 GB of memory and GitHub's runner has 16 GB,
+# so the job adds swap first; the peak it reached is in the run's summary.
+name: Fork image
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - ".github/workflows/fork-image.yml"
+      - "packaging/docker/Dockerfile.mcp"
+      - "packaging/docker/Dockerfile.mcp.dockerignore"
+      - "packaging/docker/smoke-test-mcp.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer push to main replaces a build still running; pull requests build one at a time each.
+  group: fork-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: Build, test and publish
+    if: github.repository != 'tangency-labs/solidcraft'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Make room (the runner's preinstalled SDKs the build does not use)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h / /mnt
+      - name: Add swap (16 GB of memory is not enough for wasm-bindgen)
+        run: |
+          sudo swapoff -a || true
+          # The runner's second disk (/mnt) has the room; the root disk is the fallback.
+          swapfile=/mnt/swapfile
+          avail="$(df --output=avail -BG /mnt 2>/dev/null | tail -1 | tr -dc 0-9)"
+          if [ "${avail:-0}" -lt 30 ]; then swapfile=/swapfile; fi
+          sudo fallocate -l 24G "$swapfile"
+          sudo chmod 600 "$swapfile"
+          sudo mkswap "$swapfile"
+          sudo swapon "$swapfile"
+          free -g
+      - name: Record memory use while the job runs
+        run: |
+          # shellcheck disable=SC2016  # expanded by the inner bash, on purpose
+          nohup bash -c 'peak=0; while sleep 5; do used=$(free -m | awk "/^Mem:/{m=\$3} /^Swap:/{s=\$3} END{print m+s}"); [ "$used" -gt "$peak" ] && peak=$used && echo "$peak" >"$RUNNER_TEMP/peak-mib"; done' >/dev/null 2>&1 &
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Image name
+        id: image
+        # Registry names are lower case; an owner's name may not be.
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/solidcraft-web-mcp" >>"$GITHUB_OUTPUT"
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        id: meta
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.title=SolidCraft (web) with MCP
+            org.opencontainers.image.description=SolidCraft in the browser, driven over MCP while you watch: the web app and its MCP relay on port 8080
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: packaging/docker/Dockerfile.mcp
+          platforms: linux/amd64
+          load: true
+          tags: solidcraft-web-mcp:test
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Smoke test
+        run: bash packaging/docker/smoke-test-mcp.sh solidcraft-web-mcp:test
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish
+        if: github.event_name != 'pull_request'
+        # The same build again: everything comes from the builder's cache of the step above.
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: packaging/docker/Dockerfile.mcp
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+      - name: Summary
+        if: always()
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          {
+            echo "Peak memory and swap in use: $(cat "$RUNNER_TEMP/peak-mib" 2>/dev/null || echo '?') MiB"
+            echo
+            if [ "$EVENT" = pull_request ]; then echo "Built and tested; not published (pull request)."; else echo "Tags:"; while read -r tag; do echo "- $tag"; done <<<"$TAGS"; fi
+            echo
+            docker image ls solidcraft-web-mcp:test --format 'Image size: {{.Size}}' 2>/dev/null || true
+          } >>"$GITHUB_STEP_SUMMARY"
